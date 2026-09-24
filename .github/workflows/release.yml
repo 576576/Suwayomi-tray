@@ -114,6 +114,11 @@ jobs:
     needs: [prep, build]
     runs-on: ubuntu-latest
     steps:
+      # gh release create 要跑在 git 仓库里（它用 Git 推断仓库与最近提交），
+      # 这一步漏了的表现是 `failed to run git: fatal: not a git repository`。
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v8
         with:
           path: artifacts
