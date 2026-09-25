@@ -1,118 +1,187 @@
 name: Release
 
-# 桌面壳（Tauri 托盘）的独立发布流水线。产出六个桌面 target 的裸可执行文件，
-# 由 Suwayomi-next 的打包流程按 <base>/suwayomi-tray-<V>-<target>[.exe] 下载并
-# 放进发布包根目录（与 bin/suwayomi-server 同级）。
+# 桌面壳（Tauri 托盘）的独立发布流水线。产出桌面 target 的裸可执行文件，由
+# Suwayomi-next 的打包流程按 <base>/suwayomi-tray-<V>-<target>[.exe] 下载并放进发布包
+# 根目录（与 bin/suwayomi-server 同级）。
 #
-# 触发：
-#   push tag v*          —— 版本号取 tag（v1.4.0 → 1.4.0）
-#   workflow_dispatch    —— 手动指定版本号，tag 由本工作流创建
+# 触发（与主仓同款，不再由 tag 驱动）：
+#   推送 main        → 自动构建 alpha（windows-x64 + linux-x64，两个主要桌面 target）
+#   workflow_dispatch → alpha / beta / release（通道 + target 复选）
+# 编译与打包全部委托给可复用工作流 .github/workflows/build.yml；本文件只算版本号、挑
+# target、把构建产物发布成 Release。
 #
-# 版本号必须是三段 semver：tauri-build 只认 x.y.z（Windows 上它进 PE 版本资源），
-# 写成 1.4 会在注入版本那一步才炸，所以在 prep 里先拦掉。
+# 版本号套主仓规则，只换基线与主版本（本仓库自己的计数，不跟主仓）：
+#   versionCode = 本仓库提交数 + 1000     （主仓是 +3000）
+#   版本名      = 1.{count/100}.{count%100:02d}（主仓是 3.y.z；主版本 1 是本仓自己的）
+#   tag     release → v{版本名} / beta → v{版本名}-beta.{run_id} / alpha → {版本名}-alpha.{run_id}
+# 版本名必须始终是三段 semver：build-tray.sh 会把它注入 tauri.conf.json，Windows 上还进
+# PE 版本资源 —— 写成 r{code} 会在编译那步被 tauri-build 拒掉。
 
 on:
   push:
-    tags: ['v*']
+    branches: [main]
+    # 纯文档改动不出包：一次桌面构建要占多个 runner 分钟，而文档改动对产物没有任何
+    # 影响。只要改动里还有一个非 .md 文件就照跑 —— paths-ignore 只在"全部改动都命中"
+    # 时才跳过。本文件自身不在忽略范围，所以改 CI 一定会触发。
+    # `*.md` 与 `**/*.md` 两条都给：`**/` 能否匹配"零级目录"（即命中根目录的
+    # README.md）在 glob 实现之间有歧义（GitHub 官方 cheat sheet 给的是 `'**.js'`），
+    # 两条并置后无论哪种语义都覆盖到根目录与嵌套。
+    paths-ignore:
+      - '*.md'
+      - '**/*.md'
   workflow_dispatch:
     inputs:
-      version_name:
-        description: 版本号（三段 semver，如 1.4.0）
-        required: true
+      channel:
+        description: 发布通道
+        type: choice
+        options: [alpha, beta, release]
+        default: alpha
+      build_windows_x64:
+        description: Windows x64
+        type: boolean
+        default: true
+      build_windows_arm64:
+        description: Windows arm64
+        type: boolean
+        default: true
+      build_linux_x64:
+        description: Linux x64
+        type: boolean
+        default: true
+      build_linux_arm64:
+        description: Linux arm64
+        type: boolean
+        default: true
+      build_macos_x64:
+        description: macOS x64
+        type: boolean
+        default: true
+      build_macos_arm64:
+        description: macOS arm64
+        type: boolean
+        default: true
+      version_count:
+        description: 版本计数（留空用仓库提交数）
         type: string
-
-permissions:
-  contents: write
+        default: ''
+      release_notes:
+        description: 发行说明
+        type: string
+        default: ''
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   prep:
-    name: 解析版本号
+    name: 准备构建参数
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     outputs:
-      version: ${{ steps.out.outputs.version }}
+      flow: ${{ steps.out.outputs.flow }}
+      channel: ${{ steps.out.outputs.channel }}
+      version_name: ${{ steps.out.outputs.version_name }}
+      version_code: ${{ steps.out.outputs.version_code }}
+      count: ${{ steps.out.outputs.count }}
       tag: ${{ steps.out.outputs.tag }}
-    steps:
-      - name: 版本号与 tag
-        id: out
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VER="${{ inputs.version_name }}"
-          else
-            VER="${GITHUB_REF_NAME#v}"
-          fi
-          if ! [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::版本号必须是三段 semver（如 1.4.0），收到 '$VER'"
-            exit 1
-          fi
-          echo "version=$VER" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VER" >> "$GITHUB_OUTPUT"
-          echo "桌面壳 $VER -> tag v$VER"
-
-  build:
-    name: 构建 ${{ matrix.target }}
-    needs: prep
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        # runner 与 rust target 与 Suwayomi-next 的桌面矩阵一致（原生同架构编译）。
-        include:
-          - { target: windows-x64,   os: windows-latest,   rust_target: x86_64-pc-windows-msvc }
-          - { target: windows-arm64, os: windows-11-arm,   rust_target: aarch64-pc-windows-msvc }
-          - { target: linux-x64,     os: ubuntu-latest,    rust_target: x86_64-unknown-linux-gnu }
-          - { target: linux-arm64,   os: ubuntu-24.04-arm, rust_target: aarch64-unknown-linux-gnu }
-          - { target: macos-x64,     os: macos-15-intel,   rust_target: x86_64-apple-darwin }
-          - { target: macos-arm64,   os: macos-15,         rust_target: aarch64-apple-darwin }
+      prerelease: ${{ steps.out.outputs.prerelease }}
+      targets: ${{ steps.out.outputs.targets }}
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: 安装 Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.rust_target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-      - name: 安装系统依赖（Linux）
-        # webkit2gtk 是 WebView 窗口的后端，appindicator 是托盘图标的后端；
-        # ubuntu-24.04-arm 的 arm64 源里有同名包，两个架构共用同一条命令。
-        if: runner.os == 'Linux'
+      - id: out
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
-            librsvg2-dev libxdo-dev libssl-dev
-      - name: 构建
-        shell: bash
-        env:
-          SUWAYOMI_TRAY_VERSION: ${{ needs.prep.outputs.version }}
-        run: bash build-tray.sh
-      - name: 重命名资产
-        id: name
-        shell: bash
-        run: |
-          VER="${{ needs.prep.outputs.version }}"
-          TGT="${{ matrix.target }}"
-          OUT="suwayomi-tray-${VER}-${TGT}"
-          # 判平台一律用 runner.os，不要拿 matrix.os 的 runner 标签比字面量 ——
-          # Windows 的 runner 标签不止 windows-latest 一个（还有 windows-11-arm）。
-          [ "${{ runner.os }}" = "Windows" ] && OUT="${OUT}.exe"
-          mv "target/release/suwayomi$( [ "${{ runner.os }}" = "Windows" ] && echo .exe )" "$OUT"
-          echo "asset=$OUT" >> "$GITHUB_OUTPUT"
-          echo "资产: $OUT"
-      - name: 上传构建产物
-        uses: actions/upload-artifact@v7
-        with:
-          name: suwayomi-tray-${{ needs.prep.outputs.version }}-${{ matrix.target }}
-          path: ${{ steps.name.outputs.asset }}
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            FLOW="manual"
+            CHANNEL="${{ github.event.inputs.channel }}"
+            COUNT="${{ github.event.inputs.version_count }}"
+            # 手动触发默认全量六个 target（缺一个 target 会让主仓打包时静默丢桌面壳）
+            SEL=""
+            [ "${{ github.event.inputs.build_windows_x64 }}" = "true" ] && SEL="$SEL windows-x64"
+            [ "${{ github.event.inputs.build_windows_arm64 }}" = "true" ] && SEL="$SEL windows-arm64"
+            [ "${{ github.event.inputs.build_linux_x64 }}" = "true" ] && SEL="$SEL linux-x64"
+            [ "${{ github.event.inputs.build_linux_arm64 }}" = "true" ] && SEL="$SEL linux-arm64"
+            [ "${{ github.event.inputs.build_macos_x64 }}" = "true" ] && SEL="$SEL macos-x64"
+            [ "${{ github.event.inputs.build_macos_arm64 }}" = "true" ] && SEL="$SEL macos-arm64"
+          else
+            # 推送 main：自动 alpha。托盘代码改动频率远低于主仓，六个 target 全跑要把
+            # macOS runner（10x 计费）也算进去，所以自动构建只覆盖两个主要桌面 target。
+            FLOW="auto"
+            CHANNEL="alpha"
+            COUNT=""
+            SEL="windows-x64 linux-x64"
+          fi
+
+          if [ -z "$COUNT" ]; then COUNT="$(git rev-list --count HEAD)"; fi
+
+          VER_CODE="$((COUNT+1000))"
+          # 三个通道共用同一个版本名（见文件头注释），通道差异落在 tag 与 prerelease 上
+          VER_NAME="1.$((COUNT/100)).$(printf '%02d' $((COUNT%100)))"
+
+          case "$CHANNEL" in
+            release) TAG="v${VER_NAME}";                          PRE="false" ;;
+            beta)    TAG="v${VER_NAME}-beta.${{ github.run_id }}"; PRE="false" ;;
+            alpha)   TAG="${VER_NAME}-alpha.${{ github.run_id }}"; PRE="true" ;;
+            *)       echo "::error::未知通道 $CHANNEL"; exit 1 ;;
+          esac
+
+          if [ -z "$SEL" ]; then
+            echo "::error::未选择任何构建目标"
+            exit 1
+          fi
+
+          # runner 与 rust target 与主仓 Suwayomi-next 的桌面矩阵一致（原生同架构编译）。
+          # （macos-13 已被 GitHub 下线，x64 macOS 现为 macos-15-intel。）
+          INCLUDE="$(python3 - "$SEL" <<'PY'
+          import json, sys
+          mapping = {
+              "windows-x64":   ("windows-latest",   "x86_64-pc-windows-msvc"),
+              "windows-arm64": ("windows-11-arm",   "aarch64-pc-windows-msvc"),
+              "linux-x64":     ("ubuntu-latest",    "x86_64-unknown-linux-gnu"),
+              "linux-arm64":   ("ubuntu-24.04-arm", "aarch64-unknown-linux-gnu"),
+              "macos-x64":     ("macos-15-intel",   "x86_64-apple-darwin"),
+              "macos-arm64":   ("macos-15",         "aarch64-apple-darwin"),
+          }
+          sel = sys.argv[1].split()
+          inc = [{"target": t, "os": mapping[t][0], "rust_target": mapping[t][1]}
+                 for t in sel if t in mapping]
+          print(json.dumps(inc))
+          PY
+          )"
+
+          {
+            echo "flow=$FLOW"
+            echo "channel=$CHANNEL"
+            echo "version_name=$VER_NAME"
+            echo "version_code=$VER_CODE"
+            echo "count=$COUNT"
+            echo "tag=$TAG"
+            echo "prerelease=$PRE"
+            echo "targets=$INCLUDE"
+          } >> "$GITHUB_OUTPUT"
+          echo "$FLOW 发布: $CHANNEL $VER_NAME (code $VER_CODE, commits $COUNT) -> $TAG"
+          echo "   targets=[$SEL]"
+
+  build:
+    name: 构建（复用 build.yml）
+    needs: prep
+    permissions:
+      contents: read
+    uses: ./.github/workflows/build.yml
+    with:
+      version_name: ${{ needs.prep.outputs.version_name }}
+      version_code: ${{ needs.prep.outputs.version_code }}
+      channel: ${{ needs.prep.outputs.channel }}
+      targets: ${{ needs.prep.outputs.targets }}
 
   publish:
-    name: 发布 ${{ needs.prep.outputs.tag }}
+    name: 发布 ${{ needs.prep.outputs.channel }} (${{ needs.prep.outputs.version_name }})
     needs: [prep, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       # gh release create 要跑在 git 仓库里（它用 Git 推断仓库与最近提交），
       # 这一步漏了的表现是 `failed to run git: fatal: not a git repository`。
@@ -123,13 +192,49 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: 收到的构建产物
+        run: ls -laR artifacts
       - name: 创建 Release
         env:
           GH_TOKEN: ${{ github.token }}
+          FLOW: ${{ needs.prep.outputs.flow }}
           TAG: ${{ needs.prep.outputs.tag }}
-          VER: ${{ needs.prep.outputs.version }}
+          VER: ${{ needs.prep.outputs.version_name }}
+          CH: ${{ needs.prep.outputs.channel }}
+          PRE: ${{ needs.prep.outputs.prerelease }}
+          NOTES: ${{ github.event.inputs.release_notes }}
         run: |
-          ls -la artifacts
-          gh release create "$TAG" --title "Suwayomi Tray $VER" \
-            --notes "桌面壳 $VER（六个桌面 target 的裸可执行文件）。Suwayomi-next 打包时按 target 取用。" \
-            artifacts/*
+          # release 通道同版本重复发布：先删旧 tag/release（alpha/beta 的 tag 天然唯一，不删）
+          if [ "$CH" = "release" ] && gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes --cleanup-tag || true
+          fi
+
+          FILES=()
+          for f in artifacts/*; do
+            [ -f "$f" ] || continue
+            FILES+=("$f")
+          done
+
+          if [ "$FLOW" = "auto" ]; then
+            gh release create "$TAG" "${FILES[@]}" \
+              --title "Suwayomi Tray $VER (alpha)" \
+              --notes "桌面壳 $VER · alpha（自动构建，仅 windows-x64 + linux-x64）。" \
+              --prerelease \
+              --generate-notes
+            exit 0
+          fi
+
+          BODY="桌面壳 $VER（六选 target 的裸可执行文件）。Suwayomi-next 打包时按 target 取用。"
+          NOTES="${NOTES//$'\r'/}"
+          if [ -n "$NOTES" ]; then
+            BODY="$BODY
+
+          $(printf '%b' "$NOTES")"
+          fi
+
+          gh release create "$TAG" "${FILES[@]}" \
+            --title "Suwayomi Tray $VER ($CH)" \
+            --notes "## Suwayomi Tray $VER · $CH
+          $BODY" \
+            --prerelease="$PRE" \
+            --generate-notes

@@ -1,0 +1,85 @@
+name: Build
+
+# 可复用构建工作流（workflow_call）：桌面 target 的编译与打包都在这里完成。
+# 调用方 release.yml 负责算版本号、挑 target、把结果发布成 Release —— 与主仓
+# Suwayomi-next 同款拆法（那边也是 build.yml + release.yml 两个文件）。
+#
+# 资产名固定 suwayomi-tray-<V>-<target>[.exe]，**不带通道段**：主仓的
+# Suwayomi-{VER}{通道段}-{TGT} 要带是因为 beta 与 release 共用 3.y.z 版本名，
+# 而桌面壳一个 release 里只有一套资产，通道靠 tag 区分就够了。
+# 主页 scripts/resolve-tray.sh 按这个形状正则解析，改资产名会连带失效。
+
+on:
+  workflow_call:
+    inputs:
+      version_name:
+        description: 版本名（三段 semver，如 1.0.23；注入 tauri.conf.json，Windows 上还进 PE 版本资源）
+        required: true
+        type: string
+      version_code:
+        description: 版本代号（本仓库提交数 + 1000），仅进日志
+        required: true
+        type: string
+      channel:
+        description: alpha / beta / release（仅用于日志）
+        required: true
+        type: string
+      targets:
+        description: 桌面构建矩阵 include 数组（JSON 字符串，元素含 target/os/rust_target）
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: 构建 ${{ matrix.target }}
+    # targets 可以是空数组 —— 矩阵为空会让 Actions 直接报错，所以显式跳过。
+    if: inputs.targets != '[]'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(inputs.targets) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: 安装系统依赖（Linux）
+        # webkit2gtk 是 WebView 窗口的后端，appindicator 是托盘图标的后端；
+        # ubuntu-24.04-arm 的 arm64 源里有同名包，两个架构共用同一条命令。
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev
+      - name: 构建
+        shell: bash
+        env:
+          SUWAYOMI_TRAY_VERSION: ${{ inputs.version_name }}
+        run: bash build-tray.sh
+      - name: 重命名资产
+        id: name
+        shell: bash
+        run: |
+          VER="${{ inputs.version_name }}"
+          OUT="suwayomi-tray-${VER}-${{ matrix.target }}"
+          # 判平台一律用 runner.os，不要拿 matrix.os 的 runner 标签比字面量 ——
+          # Windows 的 runner 标签不止 windows-latest 一个（还有 windows-11-arm）。
+          [ "${{ runner.os }}" = "Windows" ] && OUT="${OUT}.exe"
+          mv "target/release/suwayomi$( [ "${{ runner.os }}" = "Windows" ] && echo .exe )" "$OUT"
+          echo "asset=$OUT" >> "$GITHUB_OUTPUT"
+          echo "资产: $OUT"
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: suwayomi-tray-${{ inputs.version_name }}-${{ matrix.target }}
+          path: ${{ steps.name.outputs.asset }}

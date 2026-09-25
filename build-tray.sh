@@ -3,24 +3,23 @@
 # number injected into tauri.conf.json — on Windows that lands in the PE version
 # resource, elsewhere it is just the app metadata. Cross-platform.
 #
-# Version comes from the caller (CI takes it from the pushed tag / workflow_dispatch
-# input) via SUWAYOMI_TRAY_VERSION, and must be 3-segment semver: tauri-build rejects
-# anything else, and on Windows the FileVersion/ProductVersion strings show the same
-# digits. Without it we fall back to this repo's own commit count.
+# Version comes from the caller (CI computes it from this repo's commit count) via
+# SUWAYOMI_TRAY_VERSION, and must be 3-segment semver: tauri-build rejects anything
+# else, and on Windows the FileVersion/ProductVersion strings show the same digits.
+# Without it we fall back to this repo's own commit count, using the rule in
+# .github/workflows/release.yml.
 #
 # Usage: bash build-tray.sh  (from anywhere; runs cargo build --release)
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# --- version: caller-supplied semver, else commit count + 3000 → semver segments ---
+# --- version: caller-supplied semver, else this repo's commit count ---
 VER="${SUWAYOMI_TRAY_VERSION:-}"
 if [ -z "$VER" ]; then
   COUNT="$(git rev-list --count HEAD 2>/dev/null || echo 0)"
-  VCODE=$((COUNT + 3000))
-  # versionCode is always >= 3000 so it has ≥4 digits; take the first three
-  VS="${VCODE}"
-  VER="${VS:0:1}.${VS:1:1}.${VS:2:1}"
+  VCODE=$((COUNT + 1000))
+  VER="1.$((COUNT/100)).$(printf '%02d' $((COUNT%100)))"
   echo "[build-tray] versionCode=${VCODE} -> version ${VER} (commit-count fallback)"
 else
   echo "[build-tray] version=${VER}"
