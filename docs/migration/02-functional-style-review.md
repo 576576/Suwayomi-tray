@@ -1,8 +1,24 @@
 # 代码风格评估：函数式 vs 面向对象
 
-- 对象：`src/main.rs`（735 行，单文件）、`build.rs`、`frontend/index.html`
+- 对象：`src/main.rs`（重构前 735 行单文件）、`build.rs`、`frontend/index.html`
 - 评估日期：2026-09-26
 - 工具：`cargo clippy --all-targets`（结果见附录）
+
+---
+
+> **实施状态（2026-09-26 更新）**
+>
+> 本文 P0–P2 已在 `refactor/fp-style` 分支落地（commit `baf6f28`），P3 的
+> **A（actor 化 `AppState`）** 一并完成。
+>
+> 两项按约定推迟：
+>
+> - **H 的「PNG 挪到构建期解码」** —— 需要把 `png` 从 `[dependencies]` 移到
+>   `[build-dependencies]`，属于报告 01 的 §3.4，等 01 完成后再做。当前先让
+>   `decode_tray_icon` 返回 `Result` 而不是 panic，失败降级为无图标。
+> - **D（`Logger` 注入 / 消灭所有 `let _ =`）** —— 收益低于其改动面，留待后续。
+>
+> 依赖精简（报告 01）整体搁置，待本文全部收尾后启动。
 
 ---
 
