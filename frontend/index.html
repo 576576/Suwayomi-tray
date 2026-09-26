@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="color-scheme" content="dark light" />
-    <title>Suwayomi 设置</title>
+    <title>Suwayomi 托盘设置</title>
     <style>
       /* 亮色默认（跟随系统 prefers-color-scheme，JS 再兜底） */
       :root {
@@ -37,7 +37,7 @@
     </style>
   </head>
   <body>
-    <h3>Suwayomi 设置</h3>
+    <h3>Suwayomi 托盘设置</h3>
 
     <label for="port">服务器端口</label>
     <input id="port" type="number" min="1" max="65535" />
@@ -56,7 +56,8 @@
     <div class="hint">关闭后改用系统浏览器打开；无系统 WebView 的环境会自动回退浏览器。</div>
 
     <div class="row">
-      <button id="save" class="primary">保存并重启服务器</button>
+      <button id="save" class="primary">保存</button>
+      <button id="restart">重启服务端</button>
       <button id="open-data">打开数据目录</button>
     </div>
     <div id="url"></div>
@@ -100,12 +101,20 @@
         const ow = document.getElementById("open-webui-on-startup").checked;
         const pe = document.getElementById("prefer-web-view").checked;
         try {
-          const url = await invoke("save_settings", { serverPort: p, dataDir: dd, openWebUiOnStartup: ow, preferWebView: pe });
-          document.getElementById("url").textContent = "WebUI: " + url;
+          await invoke("save_settings", { serverPort: p, dataDir: dd, openWebUiOnStartup: ow, preferWebView: pe });
           document.getElementById("current").textContent = "当前目录: " + (dd || "默认");
-          document.getElementById("msg").textContent = "已保存并重启服务器";
+          document.getElementById("msg").textContent = "已保存，点击「重启服务端」生效";
         } catch (e) {
           document.getElementById("msg").textContent = "保存失败: " + e;
+        }
+      };
+      document.getElementById("restart").onclick = async () => {
+        try {
+          const url = await invoke("restart_server_cmd");
+          document.getElementById("url").textContent = "WebUI: " + url;
+          document.getElementById("msg").textContent = "服务端已重启";
+        } catch (e) {
+          document.getElementById("msg").textContent = "重启失败: " + e;
         }
       };
       document.getElementById("open-data").onclick = () => invoke("open_data_dir");
