@@ -567,6 +567,11 @@ enum SupervisorMsg {
         settings: Settings,
         reply: Sender<Result<(), TrayError>>,
     },
+    /// 仅落盘配置，不重启 server（「保存」按钮；生效需另行 Restart）
+    Save {
+        settings: Settings,
+        reply: Sender<Result<(), TrayError>>,
+    },
     /// 按当前配置重启
     Restart { reply: Sender<Result<(), TrayError>> },
     /// 托盘退出后不再关停 server
@@ -612,6 +617,11 @@ impl Supervisor {
         self.ask(|reply| SupervisorMsg::Apply { settings, reply })?
     }
 
+    /// 仅落盘配置（不重启）；运行态仍以旧配置为准，重启时才切换。
+    fn save(&self, settings: Settings) -> Result<(), TrayError> {
+        self.ask(|reply| SupervisorMsg::Save { settings, reply })?
+    }
+
     fn restart(&self) -> Result<(), TrayError> {
         self.ask(|reply| SupervisorMsg::Restart { reply })?
     }
@@ -647,6 +657,9 @@ fn supervisor_loop(state: ActorState, rx: Receiver<SupervisorMsg>) {
         match msg {
             SupervisorMsg::Apply { settings, reply } => {
                 let _ = reply.send(apply_settings(&mut state, settings));
+            }
+            SupervisorMsg::Save { settings, reply } => {
+                let _ = reply.send(save_only(&mut state, settings));
             }
             SupervisorMsg::Restart { reply } => {
                 let _ = reply.send(restart_server(&mut state));
@@ -702,6 +715,11 @@ fn apply_settings(state: &mut ActorState, next: Settings) -> Result<(), TrayErro
     }
 }
 
+/// 仅落盘配置：不碰 server、不改内存运行态。新配置要生效，需另行「重启服务端」。
+fn save_only(_state: &mut ActorState, next: Settings) -> Result<(), TrayError> {
+    save_settings_file(&next)
+}
+
 /// 按当前配置重启：先优雅停（内部已等进程退出），再重新拉起。
 fn restart_server(state: &mut ActorState) -> Result<(), TrayError> {
     let port = state.settings.server_port;
@@ -734,7 +752,7 @@ fn build_settings_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow,
     let url = tauri::Url::parse("settings://localhost/index.html")
         .map_err(|e| TrayError::Url(Box::new(e)))?;
     WebviewWindowBuilder::new(app, SETTINGS_WINDOW_LABEL, WebviewUrl::CustomProtocol(url))
-        .title("Suwayomi 设置")
+        .title("Suwayomi 托盘设置")
         .inner_size(480.0, 380.0)
         .resizable(false)
         .theme(Some(tauri::Theme::Dark))
@@ -985,13 +1003,12 @@ fn get_settings(supervisor: State<Supervisor>) -> Result<SettingsView, TrayError
 
 #[tauri::command]
 fn save_settings(
-    app: tauri::AppHandle,
     supervisor: State<Supervisor>,
     server_port: u16,
     data_dir: Option<String>,
     open_web_ui_on_startup: bool,
     prefer_web_view: bool,
-) -> Result<String, TrayError> {
+) -> Result<(), TrayError> {
     // 校验：非法端口直接拒绝，而不是悄悄 clamp 出一个用户没填过的数字
     if !(1..=65535).contains(&server_port) {
         return Err(TrayError::InvalidPort(server_port));
@@ -1004,13 +1021,21 @@ fn save_settings(
     }
     .into();
 
-    // 关掉旧端口的 WebUI 窗口，再按新配置重启
+    // 仅落盘：server 继续用旧配置运行；端口/数据目录要等「重启服务端」才生效
+    supervisor.save(next)
+}
+
+/// 「重启服务端」按钮：用已保存的配置停掉旧 server 并重新拉起（端口/数据目录随之生效）。
+#[tauri::command]
+fn restart_server_cmd(app: tauri::AppHandle, supervisor: State<Supervisor>) -> Result<String, TrayError> {
     let log = app.state::<Logger>().inner().clone();
+    // 端口可能变化，先关掉指向旧端口的 WebUI 窗口
     if let Some(w) = app.get_webview_window(WEBUI_WINDOW_LABEL) {
         log.best_effort("close webui window", w.close());
     }
-    supervisor.apply(next.clone())?;
-    Ok(webui_url(next.server_port))
+    let settings = load_settings(&log);
+    supervisor.apply(settings.clone())?;
+    Ok(webui_url(settings.server_port))
 }
 
 #[tauri::command]
@@ -1157,7 +1182,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     );
     let tray = TrayIconBuilder::with_id("main")
         .menu(&menu)
-        .tooltip("Suwayomi 服务")
+        .tooltip("Suwayomi")
         .show_menu_on_left_click(false)
         .icon(icon);
 
@@ -1251,6 +1276,7 @@ fn try_main() -> Result<(), TrayError> {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
+            restart_server_cmd,
             open_data_dir,
             webui_url_cmd
         ])
