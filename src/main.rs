@@ -18,19 +18,10 @@
 //! 共享可变状态只有一处：监督者线程里的 `ActorState`。托盘其余部分拿到的都是
 //! 它的不可变快照 `Runtime`，因此不存在锁中毒，也不存在「改了一半」的状态。
 //!
-//! # 错误的去向
-//!
-//! 业务结果一律不得丢：server 起不来、配置写不进，都必须留痕。
-//!
-//! - 能往上传播的走 `Result` + `?`（错误类型见 `TrayError`）；
-//! - 传播不上去的（GUI 调用、进程回收、网络收尾）走 [`best_effort`]，
-//!   失败写日志而不是静默吞掉。
-//!
-//! 只有三类地方保留裸 `let _ =`，且必须带 `// INTENTIONAL:` 注释写明理由：
-//!
-//! 1. `Logger` 底层写盘失败——日志写不进去，没有更上层可以上报；
-//! 2. 监督线程的 `reply.send`——提问方已超时离开，属正常情况；
-//! 3. `JoinHandle::join`——错误类型是 `Box<dyn Any>`，没有 `Display`。
+//! # 错误处理
+//! 业务结果一律不得丢：server 起不来、配置写不进，都必须留痕。能传播的走
+//! `Result` + `?`；传播不上去的走 [`best_effort`] 写日志，不静默吞掉。
+//! 裸 `let _ =` 仅保留在三处并带 `// INTENTIONAL:` 说明理由。
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::ffi::OsString;
@@ -50,8 +41,7 @@ use tauri::menu::{IsMenuItem, Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
 
-// 编译期生成的托盘图标：build.rs 解码 icons/tray.png → OUT_DIR/tray_icon.rs
-// （见 02 文档 §H：把"资源错误"从运行时 panic 提前成构建错误）。
+// 编译期生成：build.rs 解码 icons/tray.png 写入 OUT_DIR/tray_icon.rs
 mod tray_icon {
     include!(concat!(env!("OUT_DIR"), "/tray_icon.rs"));
 }
@@ -188,8 +178,6 @@ fn server_bin_candidates() -> impl Iterator<Item = PathBuf> {
     from_env
         .into_iter()
         .chain(beside_exe.into_iter().flat_map(|dir| {
-            // 同目录下绝不出现托盘自身的 exe：server 缺失时会把托盘自己当
-            // server 反复 spawn（fork 炸弹）；覆盖用 SUWAYOMI_BIN。
             let in_bin = SERVER_PROC_NAMES.map(|n| dir.join("bin").join(n));
             let in_dir = SERVER_PROC_NAMES.map(|n| dir.join(n));
             in_bin.into_iter().chain(in_dir)
@@ -311,12 +299,8 @@ impl Serialize for TrayError {
 // ─────────────────────────── 4. 副作用薄壳 ───────────────────────────
 
 /// 调试日志：写入 cache/logs/tray.log（release GUI 无控制台，eprintln 不可见）。
-///
-/// 每条日志都重新 open → 写 → 关闭，**故意不用 BufWriter**：这个文件是崩溃留痕
-/// 用的，进程被强杀时缓冲区里的内容会一起丢。目录只在首次 open 失败时才创建，
-/// 否则每条日志都要白搭一次 `create_dir_all` 系统调用。
-/// 原始日志汇：重新 open → 写 → 关闭，**故意不用 BufWriter**——崩溃留痕用，进程被
-/// 强杀时缓冲区内容会一起丢。目录只在首次 open 失败时才创建。
+/// 每条日志重新 open→写→关闭，故意不用 BufWriter：崩溃强杀时缓冲区内容会一起丢；
+/// 目录只在首次 open 失败时才补建，避免每条日志都白跑一次 create_dir_all。
 fn write_tray_log(msg: &str) {
     let dir = base_dir().join("cache").join("logs");
     let path = dir.join("tray.log");
@@ -334,16 +318,9 @@ fn write_tray_log(msg: &str) {
     let _ = writeln!(file, "{msg}");
 }
 
-/// 调试日志汇。把"会写磁盘"这个副作用从隐式自由函数变成**显式、可替换**的依赖
-/// （FP：副作用依赖显式传入，而非全局捕获）。
-///
-/// - `record` / `best_effort` 都走注入进来的 `sink`；默认 sink 是写文件
-///   （[`write_tray_log`]），测试可以换成收集到内存的 sink 来断言日志行为。
-/// - `Logger` 是 `Clone`（`Arc` 包裹），actor 线程与调用方各持一份，互不干扰。
-/// - 构造一次：GUI 模式经 `app.manage(Logger::file())` 注入，各处用
-///   `app.state::<Logger>()` 取出；无 `AppHandle` 的纯函数 / actor 线程 / 无图形
-///   会话降级路径，则把 `&Logger` 作为参数显式传入（这正是 §D 要消除的"隐式全局
-///   写盘"）。
+/// 日志汇：把"写磁盘"这个副作用做成显式、可替换的依赖（默认写文件，测试可换内存 sink）。
+/// `Clone`（`Arc` 包裹）使 actor 线程与调用方各持一份；经 `app.manage`/`app.state` 注入，
+/// 或在无 `AppHandle` 处把 `&Logger` 显式传入。
 #[derive(Clone)]
 struct Logger {
     sink: Arc<dyn Fn(&str) + Send + Sync>,
@@ -449,8 +426,8 @@ fn request_graceful_shutdown(port: u16, log: &Logger) {
     let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
         return;
     };
-    // 超时必须在 read 之前设置：否则 server 不响应时会永久阻塞调用线程
-    // INTENTIONAL: 尽最大努力通知，server 没收到也还有超时强杀兜底
+    // 超时必须在 read 之前设置，否则 server 不响应时会永久阻塞
+    // INTENTIONAL: 尽最大努力通知，未送达还有强杀兜底
     log.best_effort("set read timeout", stream.set_read_timeout(Some(Duration::from_secs(2))));
     let req = format!(
         "POST /api/v1/shutdown HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -487,8 +464,7 @@ fn wait_ready(port: u16, timeout: Duration) -> bool {
     poll_until(|| port_open(port), POLL_EVERY, times)
 }
 
-/// 等 server 就绪并**记录**结果。`wait_ready` 的返回值此前被 `let _ =` 丢掉，
-/// server 起不来时一点痕迹都没有；超时只告警不阻断，是否致命由调用方决定。
+/// 等 server 就绪并记录结果；超时只告警不阻断，是否致命由调用方决定。
 fn await_ready(port: u16, timeout: Duration, log: &Logger) {
     if !wait_ready(port, timeout) {
         log.record(&format!(
@@ -544,7 +520,7 @@ struct ActorState {
     child: Option<Child>,
     /// false = 托盘退出后不再关停 server（「隐藏托盘」，或已自行发起关闭）
     attached: bool,
-    /// 注入的日志汇：actor 线程里所有留痕都走它（见 §D）
+    /// 注入的日志汇：actor 线程里所有留痕都走它
     log: Logger,
 }
 
@@ -636,13 +612,12 @@ impl Supervisor {
 
     /// 退出收尾：通知监督线程停止并等待其退出（唯一一次 join）。
     fn shutdown(&self) {
-        // INTENTIONAL: 进程正在退出，通道若已断开只能放弃；join 失败同理
+        // INTENTIONAL: 进程正在退出，断开或失败只能放弃
         self.log
             .best_effort("stop supervisor", self.ask(|reply| SupervisorMsg::Shutdown { reply }));
         let handle = self.thread.lock().ok().and_then(|mut guard| guard.take());
         if let Some(h) = handle {
-            // INTENTIONAL: 线程 panic 时 join 返回 Box<dyn Any>，无 Display 可报；
-            // 监督线程若已 panic，通道断开会让后续 ask() 立刻返回 SupervisorDown
+            // INTENTIONAL: join 返回 Box<dyn Any> 无 Display；panic 时通道已断
             let _ = h.join();
         }
     }
@@ -652,8 +627,7 @@ fn supervisor_loop(state: ActorState, rx: Receiver<SupervisorMsg>) {
     let mut state = state;
 
     for msg in rx {
-        // INTENTIONAL: 应答通道由提问方持有，它可能已经超时放弃 —— send 失败只说明
-        // 没人再等这个结果，不影响状态本身（状态在 send 之前就已提交）
+        // INTENTIONAL: 提问方可能已超时离开，send 失败不影响已提交的状态
         match msg {
             SupervisorMsg::Apply { settings, reply } => {
                 let _ = reply.send(apply_settings(&mut state, settings));
@@ -1124,7 +1098,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-    // Logger 作为托管依赖注入（§D）：后续用 `app.state::<Logger>()` 取出
+    // Logger 作为托管依赖注入：后续用 `app.state::<Logger>()` 取出
     app.manage(Logger::file());
     let log = app.state::<Logger>().inner().clone();
 
@@ -1172,9 +1146,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     let menu = build_menu(app.handle(), already_running || started)?;
 
-    // 托盘小图标用专用 tray.png（「坐」放大版，小尺寸可读）；不用
-    // default_window_icon/exe ICO（缩放会糊）。窗口/任务栏仍走 exe ICO。
-    // 图标已在 build.rs 解码（§H），运行时零成本直接包成 Image。
+    // 托盘小图标用专用 tray.png（缩放清晰）；窗口/任务栏仍走 exe ICO。
+    // 图标已在 build.rs 编译期解码，运行时直接包成 Image。
     let icon = tauri::image::Image::new_owned(
         tray_icon::TRAY_ICON_RGBA.to_vec(),
         tray_icon::TRAY_ICON_W,
@@ -1205,7 +1178,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             }
         })
         .on_menu_event(|app, event| {
-            // 解析而非校验：未知 id 直接记日志返回，不再有 `_ => {}` 静默吞掉拼写错误
+            // 解析菜单 id；未知 id 记日志返回，不静默吞掉
             let log = app.state::<Logger>().inner().clone();
             let Ok(action) = TrayAction::from_str(event.id.as_ref()) else {
                 log.record(&format!("[tray] unknown menu id: {}", event.id.as_ref()));
@@ -1341,7 +1314,7 @@ mod tests {
         // 0 是合法 u16 但不是合法端口 → 字段级回落到默认
         assert_eq!(settings(r#"{"serverPort": 0}"#).server_port, DEFAULT_PORT);
         assert_eq!(settings(r#"{"serverPort": 65535}"#).server_port, 65535);
-        // 超出 u16 连反序列化都过不去 → 整个文件判为损坏，回落全套默认（与旧行为一致）
+        // 超出 u16 连反序列化都过不去 → 整个文件判为损坏，回落全套默认
         assert!(serde_json::from_str::<Settings>(r#"{"serverPort": 70000}"#).is_err());
     }
 

@@ -6,15 +6,14 @@ fn main() {
     // Tauri 的资源/配置生成（图标清单、能力、CSP 等）
     tauri_build::build();
 
-    // 编译期解码托盘图标：图标格式错误在构建阶段就失败，而不是运行时 panic
-    // （见迁移文档 docs/migration/02-functional-style-review.md §H）。解码后的
-    // RGBA 原样落到 OUT_DIR，运行时零成本直接包成 tauri Image。
+    // 编译期解码托盘图标：格式错误在构建阶段就失败，而不是运行时 panic。
+    // 解码后的 RGBA 原样落到 OUT_DIR，运行时直接包成 tauri Image。
     embed_tray_icon("icons/tray.png");
 }
 
 /// 读取并解码托盘 PNG，把 RGBA 字节 + 宽高常量写进 OUT_DIR，供 main.rs 用
-/// `include!` 在编译期内嵌。任何一步失败都 `panic!` —— 这正是 §H 的目的：
-/// 把"资源错误"从运行时崩溃提前成构建错误。
+/// `include!` 在编译期内嵌。任何一步失败都 `panic!`：把资源错误从运行时崩溃
+/// 提前成构建错误。
 fn embed_tray_icon(rel: &str) {
     let icon_path = Path::new(rel);
     let data = fs::read(icon_path)
