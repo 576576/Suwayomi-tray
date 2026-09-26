@@ -10,7 +10,7 @@
 //!
 //! 1. **配置与纯函数**（`Settings` / `SettingsPatch` / `server_env` / `webui_url` …）
 //!    —— 不碰 I/O，可独立断言。
-//! 2. **副作用薄壳**（`spawn_server` / `request_graceful_shutdown` / `tray_log` …）
+//! 2. **副作用薄壳**（`spawn_server` / `request_graceful_shutdown` / `Logger` …）
 //!    —— 只做 I/O，不含业务判断。
 //! 3. **监督者 actor**（`Supervisor`）—— server 子进程的唯一所有者，外部只能发消息。
 //! 4. **动作枚举 + 单一解释器**（`TrayAction` / `run_action`）—— 菜单项与执行分离。
@@ -28,7 +28,7 @@
 //!
 //! 只有三类地方保留裸 `let _ =`，且必须带 `// INTENTIONAL:` 注释写明理由：
 //!
-//! 1. `tray_log` 自身——日志写不进去，没有更上层可以上报；
+//! 1. `Logger` 底层写盘失败——日志写不进去，没有更上层可以上报；
 //! 2. 监督线程的 `reply.send`——提问方已超时离开，属正常情况；
 //! 3. `JoinHandle::join`——错误类型是 `Box<dyn Any>`，没有 `Display`。
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
@@ -49,6 +49,12 @@ use sysinfo::{ProcessesToUpdate, System};
 use tauri::menu::{IsMenuItem, Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Manager, RunEvent, State, WebviewUrl, WebviewWindowBuilder};
+
+// 编译期生成的托盘图标：build.rs 解码 icons/tray.png → OUT_DIR/tray_icon.rs
+// （见 02 文档 §H：把"资源错误"从运行时 panic 提前成构建错误）。
+mod tray_icon {
+    include!(concat!(env!("OUT_DIR"), "/tray_icon.rs"));
+}
 
 // ─────────────────────────────── 常量 ───────────────────────────────
 
@@ -245,13 +251,6 @@ enum TrayError {
     Tauri(tauri::Error),
     /// 固定 URL 解析失败（只可能是常量写错）
     Url(Box<dyn std::error::Error + Send + Sync>),
-    /// PNG 解码失败
-    Decode(png::DecodingError),
-    /// PNG 位深 / 色彩类型不受支持
-    IconFormat {
-        color: png::ColorType,
-        depth: png::BitDepth,
-    },
     InvalidPort(u16),
     ServerNotFound,
     /// 监督者线程已退出（或忙到超时），无法应答
@@ -265,10 +264,6 @@ impl std::fmt::Display for TrayError {
             Self::Json(e) => write!(f, "设置文件不是合法 JSON: {e}"),
             Self::Tauri(e) => write!(f, "{e}"),
             Self::Url(e) => write!(f, "URL 解析失败: {e}"),
-            Self::Decode(e) => write!(f, "托盘图标解码失败: {e}"),
-            Self::IconFormat { color, depth } => {
-                write!(f, "托盘图标格式不受支持: {color:?} / {depth:?}")
-            }
             Self::InvalidPort(p) => write!(f, "端口无效: {p}（应为 1-65535）"),
             Self::ServerNotFound => {
                 write!(f, "server 启动失败（找不到 suwayomi-server 可执行文件）")
@@ -285,7 +280,6 @@ impl std::error::Error for TrayError {
             Self::Json(e) => Some(e),
             Self::Tauri(e) => Some(e),
             Self::Url(e) => Some(&**e),
-            Self::Decode(e) => Some(e),
             _ => None,
         }
     }
@@ -306,11 +300,6 @@ impl From<tauri::Error> for TrayError {
         Self::Tauri(e)
     }
 }
-impl From<png::DecodingError> for TrayError {
-    fn from(e: png::DecodingError) -> Self {
-        Self::Decode(e)
-    }
-}
 
 /// 前端按 `"保存失败: " + e` 直接拼接，所以序列化成纯字符串以保持契约。
 impl Serialize for TrayError {
@@ -326,7 +315,9 @@ impl Serialize for TrayError {
 /// 每条日志都重新 open → 写 → 关闭，**故意不用 BufWriter**：这个文件是崩溃留痕
 /// 用的，进程被强杀时缓冲区里的内容会一起丢。目录只在首次 open 失败时才创建，
 /// 否则每条日志都要白搭一次 `create_dir_all` 系统调用。
-fn tray_log(msg: &str) {
+/// 原始日志汇：重新 open → 写 → 关闭，**故意不用 BufWriter**——崩溃留痕用，进程被
+/// 强杀时缓冲区内容会一起丢。目录只在首次 open 失败时才创建。
+fn write_tray_log(msg: &str) {
     let dir = base_dir().join("cache").join("logs");
     let path = dir.join("tray.log");
     let open = || std::fs::OpenOptions::new().create(true).append(true).open(&path);
@@ -343,22 +334,51 @@ fn tray_log(msg: &str) {
     let _ = writeln!(file, "{msg}");
 }
 
-/// 最佳努力操作：失败只留痕、不中断，替代 `let _ =` 静默吞错
-/// （`anti-empty-catch`）。用于"失败也没别的办法，但值得在日志里看见"的调用。
-fn best_effort<T, E: std::fmt::Display>(what: &str, result: Result<T, E>) {
-    if let Err(e) = result {
-        tray_log(&format!("[tray] {what}: {e}"));
+/// 调试日志汇。把"会写磁盘"这个副作用从隐式自由函数变成**显式、可替换**的依赖
+/// （FP：副作用依赖显式传入，而非全局捕获）。
+///
+/// - `record` / `best_effort` 都走注入进来的 `sink`；默认 sink 是写文件
+///   （[`write_tray_log`]），测试可以换成收集到内存的 sink 来断言日志行为。
+/// - `Logger` 是 `Clone`（`Arc` 包裹），actor 线程与调用方各持一份，互不干扰。
+/// - 构造一次：GUI 模式经 `app.manage(Logger::file())` 注入，各处用
+///   `app.state::<Logger>()` 取出；无 `AppHandle` 的纯函数 / actor 线程 / 无图形
+///   会话降级路径，则把 `&Logger` 作为参数显式传入（这正是 §D 要消除的"隐式全局
+///   写盘"）。
+#[derive(Clone)]
+struct Logger {
+    sink: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+impl Logger {
+    /// 默认 sink：写 cache/logs/tray.log（release GUI 无控制台，eprintln 不可见）。
+    fn file() -> Self {
+        Logger {
+            sink: Arc::new(write_tray_log),
+        }
+    }
+
+    /// 写一条调试日志。失败（磁盘满/权限）不影响托盘功能，也没有更上层可传播。
+    fn record(&self, msg: &str) {
+        (self.sink)(msg);
+    }
+
+    /// 最佳努力操作：失败只留痕、不中断，替代 `let _ =` 静默吞错
+    /// （`anti-empty-catch`）。用于"失败也没别的办法，但值得在日志里看见"的调用。
+    fn best_effort<T, E: std::fmt::Display>(&self, what: &str, result: Result<T, E>) {
+        if let Err(e) = result {
+            self.record(&format!("[tray] {what}: {e}"));
+        }
     }
 }
 
 /// 读设置。缺文件 / 解析失败都回落到默认值，但**留痕** —— 否则会表现成
 /// "设置没生效"。
-fn load_settings() -> Settings {
+fn load_settings(log: &Logger) -> Settings {
     match std::fs::read_to_string(settings_path()) {
         Ok(text) => match serde_json::from_str::<Settings>(&text) {
             Ok(s) => s,
             Err(e) => {
-                tray_log(&format!(
+                log.record(&format!(
                     "[tray] WARN: {} 解析失败（{e}），本次使用默认设置",
                     settings_path().display()
                 ));
@@ -379,12 +399,12 @@ fn save_settings_file(settings: &Settings) -> Result<(), TrayError> {
 }
 
 /// 定位 server 二进制：候选表里第一个真实存在的文件；找不到时把候选表打进日志。
-fn find_server_bin() -> Option<PathBuf> {
+fn find_server_bin(log: &Logger) -> Option<PathBuf> {
     let found = server_bin_candidates().find(|p| p.is_file());
     if found.is_none() {
         // 只在失败路径上再枚举一次候选表（惰性迭代器已被消费），换掉一次克隆
         let candidates: Vec<_> = server_bin_candidates().collect();
-        tray_log(&format!(
+        log.record(&format!(
             "[tray] WARN: server binary not found (set SUWAYOMI_BIN or place \
              suwayomi-server next to this exe); candidates: {candidates:?}"
         ));
@@ -424,38 +444,38 @@ fn kill_server_processes() {
 }
 
 /// 请求 server 优雅关闭（POST loopback /api/v1/shutdown：停 postgres、杀 JVM 沙盒）
-fn request_graceful_shutdown(port: u16) {
-    tray_log(&format!("[tray] requesting graceful shutdown on port {port}"));
+fn request_graceful_shutdown(port: u16, log: &Logger) {
+    log.record(&format!("[tray] requesting graceful shutdown on port {port}"));
     let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
         return;
     };
     // 超时必须在 read 之前设置：否则 server 不响应时会永久阻塞调用线程
     // INTENTIONAL: 尽最大努力通知，server 没收到也还有超时强杀兜底
-    best_effort("set read timeout", stream.set_read_timeout(Some(Duration::from_secs(2))));
+    log.best_effort("set read timeout", stream.set_read_timeout(Some(Duration::from_secs(2))));
     let req = format!(
         "POST /api/v1/shutdown HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
-    best_effort("send shutdown request", stream.write_all(req.as_bytes()));
+    log.best_effort("send shutdown request", stream.write_all(req.as_bytes()));
     let mut buf = [0u8; 256];
-    best_effort("read shutdown response", stream.read(&mut buf));
+    log.best_effort("read shutdown response", stream.read(&mut buf));
 }
 
 /// 优雅停 server：请求 shutdown → 轮询等待 → 超时强杀兜底 → 回收子进程句柄。
 /// 强杀残留的 postgres 子进程由 server 下次启动自愈清理。
-fn stop_server(port: u16, child: &mut Option<Child>) {
+fn stop_server(port: u16, child: &mut Option<Child>, log: &Logger) {
     if server_running(port) {
-        request_graceful_shutdown(port);
+        request_graceful_shutdown(port, log);
         if poll_until(|| !server_running(port), POLL_EVERY, STOP_POLL_TIMES) {
-            tray_log("[tray] server exited gracefully");
+            log.record("[tray] server exited gracefully");
         } else {
-            tray_log("[tray] graceful shutdown timed out; force-killing server");
+            log.record("[tray] graceful shutdown timed out; force-killing server");
             kill_server_processes();
         }
     }
     // 只回收句柄：Windows 父进程退出本就不杀子进程
     if let Some(mut c) = child.take() {
         // INTENTIONAL: 纯清理，wait 失败只意味着子进程已被别人回收
-        best_effort("reap server child", c.wait());
+        log.best_effort("reap server child", c.wait());
     }
 }
 
@@ -469,9 +489,9 @@ fn wait_ready(port: u16, timeout: Duration) -> bool {
 
 /// 等 server 就绪并**记录**结果。`wait_ready` 的返回值此前被 `let _ =` 丢掉，
 /// server 起不来时一点痕迹都没有；超时只告警不阻断，是否致命由调用方决定。
-fn await_ready(port: u16, timeout: Duration) {
+fn await_ready(port: u16, timeout: Duration, log: &Logger) {
     if !wait_ready(port, timeout) {
-        tray_log(&format!(
+        log.record(&format!(
             "[tray] WARN: server on port {port} not ready within {}s",
             timeout.as_secs()
         ));
@@ -487,8 +507,8 @@ fn ensure_data_dirs(data: &Path) -> Result<(), TrayError> {
 }
 
 /// `inherit_stdio=true` 前台模式直接继承控制台；否则输出落 cache/logs/server.log
-fn spawn_server(data: &Path, port: u16, inherit_stdio: bool) -> Result<Child, TrayError> {
-    let bin = find_server_bin().ok_or(TrayError::ServerNotFound)?;
+fn spawn_server(data: &Path, port: u16, inherit_stdio: bool, log: &Logger) -> Result<Child, TrayError> {
+    let bin = find_server_bin(log).ok_or(TrayError::ServerNotFound)?;
     let base = base_dir();
     let logs = base.join("cache").join("logs");
     std::fs::create_dir_all(&logs)?;
@@ -515,40 +535,6 @@ fn spawn_server(data: &Path, port: u16, inherit_stdio: bool) -> Result<Child, Tr
     Ok(child)
 }
 
-/// 编译期内联 PNG（8-bit RGBA/RGB）解码为 tauri Image（托盘图标用）。
-/// 资源是编译期常量，写错本该是构建错误；这里至少不 panic，交由调用方降级。
-fn decode_tray_icon(data: &[u8]) -> Result<tauri::image::Image<'static>, TrayError> {
-    use png::{BitDepth, ColorType};
-
-    let mut reader = png::Decoder::new(data).read_info()?;
-    let mut buf = vec![0u8; reader.output_buffer_size()];
-    let (color_type, bit_depth, w, h) = {
-        let info = reader.next_frame(&mut buf)?;
-        (info.color_type, info.bit_depth, info.width, info.height)
-    };
-
-    // 直接吃 buf：`output_buffer_size()` 就是 w×h×通道数，不必自己再算一遍，
-    // 省掉一次溢出可能（`w*h*4` 在 64 位上也能溢出）和一次拷贝
-    let rgba = match (color_type, bit_depth) {
-        (ColorType::Rgba, BitDepth::Eight) => buf,
-        (ColorType::Rgb, BitDepth::Eight) => {
-            let (chunks, _rest) = buf.as_chunks::<3>();
-            let mut out = Vec::with_capacity(chunks.len() * 4);
-            for [r, g, b] in chunks {
-                out.extend_from_slice(&[*r, *g, *b, 255]);
-            }
-            out
-        }
-        other => {
-            return Err(TrayError::IconFormat {
-                color: other.0,
-                depth: other.1,
-            })
-        }
-    };
-    Ok(tauri::image::Image::new_owned(rgba, w, h))
-}
-
 // ─────────────────────────── 5. 监督者 actor ───────────────────────────
 
 /// 监督者线程私有的状态：server 子进程的唯一所有者。
@@ -558,6 +544,8 @@ struct ActorState {
     child: Option<Child>,
     /// false = 托盘退出后不再关停 server（「隐藏托盘」，或已自行发起关闭）
     attached: bool,
+    /// 注入的日志汇：actor 线程里所有留痕都走它（见 §D）
+    log: Logger,
 }
 
 /// 对外暴露的不可变快照。
@@ -589,20 +577,24 @@ enum SupervisorMsg {
     Shutdown { reply: Sender<()> },
 }
 
-/// 监督者的句柄：只有消息通道和一个 join handle，状态本身拿不到。
+/// 监督者的句柄：只有消息通道、一个 join handle，以及一个注入的日志汇，
+/// 状态本身拿不到。
 #[derive(Clone)]
 struct Supervisor {
     tx: Arc<Sender<SupervisorMsg>>,
     thread: Arc<Mutex<Option<JoinHandle<()>>>>,
+    log: Logger,
 }
 
 impl Supervisor {
     fn spawn(state: ActorState) -> Supervisor {
+        let log = state.log.clone();
         let (tx, rx) = mpsc::channel();
         let thread = std::thread::spawn(move || supervisor_loop(state, rx));
         Supervisor {
             tx: Arc::new(tx),
             thread: Arc::new(Mutex::new(Some(thread))),
+            log,
         }
     }
 
@@ -635,7 +627,8 @@ impl Supervisor {
     /// 退出收尾：通知监督线程停止并等待其退出（唯一一次 join）。
     fn shutdown(&self) {
         // INTENTIONAL: 进程正在退出，通道若已断开只能放弃；join 失败同理
-        best_effort("stop supervisor", self.ask(|reply| SupervisorMsg::Shutdown { reply }));
+        self.log
+            .best_effort("stop supervisor", self.ask(|reply| SupervisorMsg::Shutdown { reply }));
         let handle = self.thread.lock().ok().and_then(|mut guard| guard.take());
         if let Some(h) = handle {
             // INTENTIONAL: 线程 panic 时 join 返回 Box<dyn Any>，无 Display 可报；
@@ -677,7 +670,7 @@ fn supervisor_loop(state: ActorState, rx: Receiver<SupervisorMsg>) {
 
     // 线程退出（收到 Shutdown，或所有句柄被丢弃）：仍托管则发一次非阻塞的关闭请求
     if state.attached {
-        request_graceful_shutdown(state.settings.server_port);
+        request_graceful_shutdown(state.settings.server_port, &state.log);
     }
     drop(state.child);
 }
@@ -689,9 +682,9 @@ fn apply_settings(state: &mut ActorState, next: Settings) -> Result<(), TrayErro
     ensure_data_dirs(&next_data)?;
     std::fs::create_dir_all(&next_data)?;
 
-    stop_server(state.settings.server_port, &mut state.child);
+    stop_server(state.settings.server_port, &mut state.child, &state.log);
 
-    let child = spawn_server(&next_data, next.server_port, false);
+    let child = spawn_server(&next_data, next.server_port, false, &state.log);
     // 配置已落盘，内存立即跟进 —— 状态与磁盘保持一致，即便启动失败
     state.settings = next;
     state.data = next_data;
@@ -699,11 +692,11 @@ fn apply_settings(state: &mut ActorState, next: Settings) -> Result<(), TrayErro
     match child {
         Ok(c) => {
             state.child = Some(c);
-            await_ready(state.settings.server_port, READY_TIMEOUT);
+            await_ready(state.settings.server_port, READY_TIMEOUT, &state.log);
             Ok(())
         }
         Err(e) => {
-            tray_log(&format!("[tray] restart after settings change failed: {e}"));
+            state.log.record(&format!("[tray] restart after settings change failed: {e}"));
             Err(e)
         }
     }
@@ -714,19 +707,19 @@ fn restart_server(state: &mut ActorState) -> Result<(), TrayError> {
     let port = state.settings.server_port;
     let data = state.data.clone();
 
-    tray_log("[tray] restart: stopping running server");
-    stop_server(port, &mut state.child);
+    state.log.record("[tray] restart: stopping running server");
+    stop_server(port, &mut state.child, &state.log);
     // 进程已退出，但端口释放可能还有延迟
     std::thread::sleep(Duration::from_secs(2));
 
-    match spawn_server(&data, port, false) {
+    match spawn_server(&data, port, false, &state.log) {
         Ok(c) => {
             state.child = Some(c);
-            await_ready(port, RESTART_READY_TIMEOUT);
+            await_ready(port, RESTART_READY_TIMEOUT, &state.log);
             Ok(())
         }
         Err(e) => {
-            tray_log(&format!("[tray] restart failed: {e}"));
+            state.log.record(&format!("[tray] restart failed: {e}"));
             Err(e)
         }
     }
@@ -752,29 +745,31 @@ fn build_settings_window(app: &tauri::AppHandle) -> Result<tauri::WebviewWindow,
 }
 
 fn show_settings_window(app: &tauri::AppHandle) {
+    let log = app.state::<Logger>().inner().clone();
     match app.get_webview_window(SETTINGS_WINDOW_LABEL) {
         Some(w) => {
-            best_effort("show window", w.show());
-            best_effort("focus window", w.set_focus());
+            log.best_effort("show window", w.show());
+            log.best_effort("focus window", w.set_focus());
         }
         // 无 WebView 引擎（精简系统）：设置窗口不可用
-        None => tray_log("[tray] settings window not available (no system webview)"),
+        None => log.record("[tray] settings window not available (no system webview)"),
     }
 }
 
 /// 打开/聚焦 WebUI 窗口（label "webui"，已存在→show+focus，销毁后重建）。
 /// 返回 false = 系统 WebView 不可用，调用方应回退系统浏览器。
 fn open_webui_window(app: &tauri::AppHandle, port: u16) -> bool {
+    let log = app.state::<Logger>().inner().clone();
     if let Some(w) = app.get_webview_window(WEBUI_WINDOW_LABEL) {
-        best_effort("show window", w.show());
-        best_effort("unminimize window", w.unminimize());
-        best_effort("focus window", w.set_focus());
-        tray_log("[tray] webui window exists; focusing existing window");
+        log.best_effort("show window", w.show());
+        log.best_effort("unminimize window", w.unminimize());
+        log.best_effort("focus window", w.set_focus());
+        log.record("[tray] webui window exists; focusing existing window");
         return true;
     }
 
     let Ok(url) = tauri::Url::parse(&webui_url(port)) else {
-        tray_log(&format!("[tray] invalid webui url for port {port}"));
+        log.record(&format!("[tray] invalid webui url for port {port}"));
         return false;
     };
 
@@ -783,30 +778,36 @@ fn open_webui_window(app: &tauri::AppHandle, port: u16) -> bool {
         .inner_size(1280.0, 860.0)
         // WebUI 里的外部链接（关于/文档、追踪器授权页等）一律交系统浏览器：拦截顶层导航
         // 与 target=_blank/window.open 新窗请求，不在 WebView 里打开
-        .on_navigation(move |url| {
-            if is_webui_origin(url) {
-                return true;
+        .on_navigation({
+            let log = log.clone();
+            move |url| {
+                if is_webui_origin(url) {
+                    return true;
+                }
+                log.record(&format!("[tray] external link -> browser: {url}"));
+                log.best_effort("open in browser", open::that(url.to_string()));
+                false
             }
-            tray_log(&format!("[tray] external link -> browser: {url}"));
-            best_effort("open in browser", open::that(url.to_string()));
-            false
         })
-        .on_new_window(move |url, _features| {
-            tray_log(&format!("[tray] external link (new window) -> browser: {url}"));
-            best_effort("open in browser", open::that(url.to_string()));
-            tauri::webview::NewWindowResponse::Deny
+        .on_new_window({
+            let log = log.clone();
+            move |url, _features| {
+                log.record(&format!("[tray] external link (new window) -> browser: {url}"));
+                log.best_effort("open in browser", open::that(url.to_string()));
+                tauri::webview::NewWindowResponse::Deny
+            }
         })
         .build()
     {
         Ok(w) => {
             // 不 set_icon：标题栏与任务栏共用 WM_SETICON，set 后任务栏也会变
-            best_effort("show window", w.show());
-            best_effort("focus window", w.set_focus());
-            tray_log(&format!("[tray] opened webui window: {}", webui_url(port)));
+            log.best_effort("show window", w.show());
+            log.best_effort("focus window", w.set_focus());
+            log.record(&format!("[tray] opened webui window: {}", webui_url(port)));
             true
         }
         Err(e) => {
-            tray_log(&format!(
+            log.record(&format!(
                 "[tray] system webview unavailable ({e}); falling back to system browser"
             ));
             false
@@ -816,12 +817,13 @@ fn open_webui_window(app: &tauri::AppHandle, port: u16) -> bool {
 
 /// 打开 WebUI：设置开启且 WebView 窗口可用 → 窗口，否则系统浏览器
 fn launch_webui(app: &tauri::AppHandle, rt: &Runtime) {
+    let log = app.state::<Logger>().inner().clone();
     if rt.settings.prefer_web_view && open_webui_window(app, rt.port()) {
         return;
     }
     let url = webui_url(rt.port());
-    tray_log(&format!("[tray] opening webui in system browser: {url}"));
-    best_effort("open in browser", open::that(url));
+    log.record(&format!("[tray] opening webui in system browser: {url}"));
+    log.best_effort("open in browser", open::that(url));
 }
 
 // ────────────────────── 7. 菜单动作：枚举 + 解释器 ──────────────────────
@@ -910,10 +912,11 @@ fn build_menu(app: &tauri::AppHandle, running: bool) -> Result<Menu<tauri::Wry>,
 
 /// 单一解释器：所有托盘动作只在这里被执行（穷尽匹配，加菜单项时编译器强制处理）。
 fn run_action(action: TrayAction, app: &tauri::AppHandle, supervisor: &Supervisor) {
+    let log = app.state::<Logger>().inner().clone();
     match action {
         TrayAction::Start => {
             if let Err(e) = supervisor.restart() {
-                tray_log(&format!("[tray] start/restart server failed: {e}"));
+                log.record(&format!("[tray] start/restart server failed: {e}"));
             }
         }
         TrayAction::OpenWebUi => {
@@ -923,23 +926,23 @@ fn run_action(action: TrayAction, app: &tauri::AppHandle, supervisor: &Superviso
         }
         TrayAction::OpenData => {
             if let Some(rt) = supervisor.runtime() {
-                best_effort("open data dir", open::that(&rt.data));
+                log.best_effort("open data dir", open::that(&rt.data));
             }
         }
         TrayAction::Settings => show_settings_window(app),
         TrayAction::HideTray => {
             // 托盘退出、server 保持后台运行
-            tray_log("[tray] hide_tray: keeping server running, exiting tray");
-            best_effort("detach supervisor", supervisor.detach());
+            log.record("[tray] hide_tray: keeping server running, exiting tray");
+            log.best_effort("detach supervisor", supervisor.detach());
             app.exit(0);
         }
         TrayAction::Quit => {
             // 托盘立即退出：只发优雅关闭请求，server 后台自行收尾。
             // 已自行发起，标记 detach 以免退出收尾时重复请求。
             if let Some(rt) = supervisor.runtime() {
-                request_graceful_shutdown(rt.port());
+                request_graceful_shutdown(rt.port(), &log);
             }
-            best_effort("detach supervisor", supervisor.detach());
+            log.best_effort("detach supervisor", supervisor.detach());
             app.exit(0);
         }
     }
@@ -1002,8 +1005,9 @@ fn save_settings(
     .into();
 
     // 关掉旧端口的 WebUI 窗口，再按新配置重启
+    let log = app.state::<Logger>().inner().clone();
     if let Some(w) = app.get_webview_window(WEBUI_WINDOW_LABEL) {
-        best_effort("close webui window", w.close());
+        log.best_effort("close webui window", w.close());
     }
     supervisor.apply(next.clone())?;
     Ok(webui_url(next.server_port))
@@ -1036,7 +1040,9 @@ fn has_graphical_session() -> bool {
 /// 跑 bin/suwayomi-server），不返回。
 #[cfg(target_os = "linux")]
 fn run_server_foreground() -> ! {
-    let settings = load_settings();
+    // 无图形会话降级路径没有 AppHandle 可托管 Logger，直接用默认文件 sink 注入
+    let log = Logger::file();
+    let settings = load_settings(&log);
     let port = settings.server_port;
     let data = data_dir_of(&settings);
     if let Err(e) = ensure_data_dirs(&data) {
@@ -1049,7 +1055,7 @@ fn run_server_foreground() -> ! {
         std::process::exit(1);
     }
 
-    let mut child = match spawn_server(&data, port, true) {
+    let mut child = match spawn_server(&data, port, true, &log) {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
@@ -1059,7 +1065,7 @@ fn run_server_foreground() -> ! {
         }
     };
 
-    await_ready(port, READY_TIMEOUT);
+    await_ready(port, READY_TIMEOUT, &log);
     eprintln!(
         "suwayomi-server ready on {} (Ctrl-C to stop)",
         webui_url(port)
@@ -1093,25 +1099,29 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(target_os = "macos")]
     app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-    let settings = load_settings();
+    // Logger 作为托管依赖注入（§D）：后续用 `app.state::<Logger>()` 取出
+    app.manage(Logger::file());
+    let log = app.state::<Logger>().inner().clone();
+
+    let settings = load_settings(&log);
     let port = settings.server_port;
     let data = data_dir_of(&settings);
     ensure_data_dirs(&data)?;
 
     // 探测只做一次：菜单文案与是否拉起 server 必须基于同一个答案
     let already_running = server_running(port);
-    tray_log(&format!("[tray] setup: server_running={already_running}"));
+    log.record(&format!("[tray] setup: server_running={already_running}"));
 
     let mut child = None;
     if already_running {
-        tray_log("[tray] server already running; not starting another");
+        log.record("[tray] server already running; not starting another");
     } else {
-        match spawn_server(&data, port, false) {
+        match spawn_server(&data, port, false, &log) {
             Ok(c) => {
                 child = Some(c);
-                await_ready(port, READY_TIMEOUT);
+                await_ready(port, READY_TIMEOUT, &log);
             }
-            Err(e) => tray_log(&format!(
+            Err(e) => log.record(&format!(
                 "[tray] WARN: server not started ({e}); set SUWAYOMI_BIN or place \
                  suwayomi-server next to this exe"
             )),
@@ -1121,7 +1131,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     // 设置窗口：不可见创建（托盘菜单唤起）；WebView 不可用仅告警不中断
     if let Err(e) = build_settings_window(app.handle()) {
-        tray_log(&format!(
+        log.record(&format!(
             "[tray] settings window unavailable (no system webview?): {e}"
         ));
     }
@@ -1131,6 +1141,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         data: data.clone(),
         child,
         attached: true,
+        log: log.clone(),
     });
     app.manage(supervisor.clone());
 
@@ -1138,14 +1149,17 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     // 托盘小图标用专用 tray.png（「坐」放大版，小尺寸可读）；不用
     // default_window_icon/exe ICO（缩放会糊）。窗口/任务栏仍走 exe ICO。
-    let mut tray = TrayIconBuilder::with_id("main")
+    // 图标已在 build.rs 解码（§H），运行时零成本直接包成 Image。
+    let icon = tauri::image::Image::new_owned(
+        tray_icon::TRAY_ICON_RGBA.to_vec(),
+        tray_icon::TRAY_ICON_W,
+        tray_icon::TRAY_ICON_H,
+    );
+    let tray = TrayIconBuilder::with_id("main")
         .menu(&menu)
         .tooltip("Suwayomi")
-        .show_menu_on_left_click(false);
-    match decode_tray_icon(include_bytes!("../icons/tray.png")) {
-        Ok(icon) => tray = tray.icon(icon),
-        Err(e) => tray_log(&format!("[tray] tray icon unavailable: {e}")),
-    }
+        .show_menu_on_left_click(false)
+        .icon(icon);
 
     // 图标已注册进 app 的资源表，`_tray` 离开作用域不会把它撤掉
     let _tray = tray
@@ -1167,8 +1181,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         })
         .on_menu_event(|app, event| {
             // 解析而非校验：未知 id 直接记日志返回，不再有 `_ => {}` 静默吞掉拼写错误
+            let log = app.state::<Logger>().inner().clone();
             let Ok(action) = TrayAction::from_str(event.id.as_ref()) else {
-                tray_log(&format!("[tray] unknown menu id: {}", event.id.as_ref()));
+                log.record(&format!("[tray] unknown menu id: {}", event.id.as_ref()));
                 return;
             };
             if let Some(supervisor) = app.try_state::<Supervisor>() {
@@ -1189,8 +1204,9 @@ fn on_window_event(window: &tauri::Window, event: &tauri::WindowEvent) {
     if window.label() != SETTINGS_WINDOW_LABEL {
         return;
     }
+    let log = window.app_handle().state::<Logger>().inner().clone();
     if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-        best_effort("hide settings window", window.hide());
+        log.best_effort("hide settings window", window.hide());
         api.prevent_close();
     }
 }
@@ -1210,7 +1226,8 @@ fn main() {
     maybe_run_headless();
 
     if let Err(e) = try_main() {
-        tray_log(&format!("[tray] fatal: {e}"));
+        // 还没进 GUI / 没有 app 可托管 Logger，直接用默认文件 sink
+        Logger::file().record(&format!("[tray] fatal: {e}"));
         eprintln!("[tray] fatal: {e}");
         std::process::exit(1);
     }
@@ -1220,14 +1237,15 @@ fn try_main() -> Result<(), TrayError> {
     let app = tauri::Builder::default()
         // 单实例：重复启动时第二实例直接退出，聚焦已有窗口
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            tray_log("[tray] single-instance: second launch detected, focusing existing window");
+            let log = app.state::<Logger>().inner().clone();
+            log.record("[tray] single-instance: second launch detected, focusing existing window");
             if let Some(w) = app.get_webview_window(WEBUI_WINDOW_LABEL) {
-                best_effort("show window", w.show());
-                best_effort("unminimize window", w.unminimize());
-                best_effort("focus window", w.set_focus());
+                log.best_effort("show window", w.show());
+                log.best_effort("unminimize window", w.unminimize());
+                log.best_effort("focus window", w.set_focus());
             } else if let Some(w) = app.get_webview_window(SETTINGS_WINDOW_LABEL) {
-                best_effort("show window", w.show());
-                best_effort("focus window", w.set_focus());
+                log.best_effort("show window", w.show());
+                log.best_effort("focus window", w.set_focus());
             }
         }))
         .invoke_handler(tauri::generate_handler![

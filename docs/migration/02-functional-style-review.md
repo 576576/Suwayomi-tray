@@ -11,12 +11,18 @@
 > 本文 P0–P2 已在 `refactor/fp-style` 分支落地（commit `baf6f28`），P3 的
 > **A（actor 化 `AppState`）** 一并完成。
 >
-> 两项按约定推迟：
+> 两项推迟项已在本分支后续补齐：
 >
-> - **H 的「PNG 挪到构建期解码」** —— 需要把 `png` 从 `[dependencies]` 移到
->   `[build-dependencies]`，属于报告 01 的 §3.4，等 01 完成后再做。当前先让
->   `decode_tray_icon` 返回 `Result` 而不是 panic，失败降级为无图标。
-> - **D（`Logger` 注入 / 消灭所有 `let _ =`）** —— 收益低于其改动面，留待后续。
+> - **H（PNG 挪到构建期解码）** —— 已做。`build.rs` 用 `png` 解码
+>   `icons/tray.png`，把 RGBA 字节 + 宽高常量写进 `OUT_DIR/tray_icon.rs`，`main.rs`
+>   用 `include!` 在编译期内嵌；运行时不再依赖 `png`（`png` 已移入
+>   `[build-dependencies]`），并删掉了 `decode_tray_icon` 与 `TrayError` 的
+>   `Decode` / `IconFormat` 变体。图标格式错误现在是**构建错误**而非运行时 panic。
+> - **D（`Logger` 注入）** —— 已做。新增 `Logger` 类型（`Arc<dyn Fn>` 可替换 sink，
+>   默认 sink 写 `cache/logs/tray.log`），经 `app.manage(Logger::file())` 注入，各处用
+>   `app.state::<Logger>()` 取出；无 `AppHandle` 的纯函数 / actor 线程 / 无图形会话
+>   降级路径，则把 `&Logger` 作为参数显式传入。`tray_log` 自由函数已删除，
+>   `best_effort` 改为 `Logger` 的方法。"会写磁盘"这个副作用从隐式全局变成显式依赖。
 >
 > 依赖精简（报告 01）整体搁置，待本文全部收尾后启动。
 >
@@ -24,16 +30,15 @@
 >
 > 装好该 skill 后对照重查，又落了一轮改动（同一分支，未单独开 commit 前累积）：
 >
-> - **`anti-empty-catch` / `err-result-over-panic`**：新增 `best_effort(what, result)`
+> - **`anti-empty-catch` / `err-result-over-panic`**：新增 `Logger::best_effort`
 >   替代约 20 处静默 `let _ =`（`tray_log` 自身、`supervisor` 回包、`JoinHandle::join`
 >   三处保留 `let _ =` 并标注 `// INTENTIONAL`：要么无错误可暴露，要么无上层可传播）。
 >   `sysinfo::Process::kill()` 返回 `bool` 而非 `Result`，直接调用并标注 `// INTENTIONAL`，
->   不强行塞进 `best_effort`。这等于把 D 的"消灭 `let _ =`"做了一半——日志可见，但
->   未做 `Logger` 注入。
+>   不强行塞进 `best_effort`。
 > - **`err-expect-bugs-only` / `anti-unwrap-abuse`**：`TrayError` 去掉全部 stringly-typed
 >   变体（`Icon(String)` / `Menu(String)` / `Url(String)`），改为类型化
->   `Decode(png::DecodingError)` / `IconFormat { color, depth }` / `Url(Box<dyn Error+Send+Sync>)`
->   / `Tauri(tauri::Error)`；`decode_tray_icon` 改用 `?` 传播而非 `.expect`/`panic!`。
+>   `Url(Box<dyn Error+Send+Sync>)` / `Tauri(tauri::Error)`；`Decode` / `IconFormat`
+>   随 PNG 移入构建期被一并删除。
 > - **`own-slice-over-vec`**：`server_bin_candidates` 由分配 `Vec` 改为惰性
 >   `impl Iterator<Item = PathBuf>`，调用方命中即短路，失败路径才 `collect` 一次用于留痕。
 > - `cargo clippy --all-targets` 零警告，14 个单测全绿，默认 `cargo build` 通过。
@@ -224,6 +229,12 @@ fn stop_server_gracefully(port: u16) {
 - 短中期：把 `tray_log` 换成一个注入的 `Logger` 值（哪怕只是 `Arc<dyn Fn(&str)>`），让调用方签名显式声明它需要日志能力；
 - 对吞错的地方：要么返回 `Result` 往上传播，要么显式收集成 `Vec<Warning>` 一起返回——不要 `let _ =`。
 
+> **实施（refactor/fp-style）：已落地。** 自由函数 `tray_log` 删除，改为可注入的
+> `Logger`（`Arc<dyn Fn>` sink，默认写 `cache/logs/tray.log`），经 `app.manage(Logger::file())`
+> 注入、`app.state::<Logger>()` 取出；无 `AppHandle` 的纯函数 / actor 线程 / 无图形会话
+> 降级路径，把 `&Logger` 作为参数显式传入；`best_effort` 成为 `Logger` 的方法。
+> 约 20 处 `let _ =` 已被 `best_effort` 替换，仅剩三处保留并标注 `// INTENTIONAL`。
+
 ---
 
 ### E. 字符串化错误 + 校验与副作用混在一个函数里
@@ -331,6 +342,11 @@ fn setup(app: &mut tauri::App) -> Result<(), TrayError> {
 | `:320, 594` | `tauri::Url::parse(..).expect(..)` | 同样是常量，应 `OnceLock` 惰性初始化或在构建期校验 |
 | `:116` | `to_string_pretty(settings).expect("serialize settings")` | 对该类型不可能失败；用类型不变式消除，而不是 `expect` |
 
+> **实施（refactor/fp-style）：已落地。** `decode_png_icon`（重构后名 `decode_tray_icon`）
+> 已删除，PNG 解码挪到 `build.rs`（`png` 移入 `[build-dependencies]`），图标格式错误
+> 现在是**构建错误**而非运行时 panic。`:320` 的 `tauri::Url::parse` 早先已改为 `?`
+> 传播并类型化为 `TrayError::Url`；`:116` 的序列化 `expect` 在重构中已改为 `?`。
+
 ---
 
 ### I. 两个实际缺陷（风格审查时发现的）
@@ -377,11 +393,11 @@ fn setup(app: &mut tauri::App) -> Result<(), TrayError> {
 | P0 | 依赖报告 §3.1 + §4.1/§4.2（feature、frontendDist、capability） | 30 min | −6 crate，拆掉定时炸弹 |
 | P1 | C5/C6 抽 `poll_until`；C1 拆 `server_bin_candidates` | 1 h | 少 40 行，逻辑可测 |
 | P1 | E 引入 `TrayError` 枚举，拆 `normalize` / `apply` | 2 h | 错误处理从字符串升级为类型 |
-| P1 | H panic 搬进 build.rs | 1 h | 资源错误变成编译错误 |
+| P1 | H panic 搬进 build.rs | 1 h | 资源错误变成编译错误 | ✅ 已完成 |
 | P2 | F `TrayAction` 枚举 + 单一解释器 | 2 h | 消除 id 拼写失效、穷尽匹配 |
 | P2 | G 拆 `main()` 为具名阶段 | 2 h | 可读性 |
 | P3 | A actor 化 `AppState` | 半天 | 消灭共享可变状态与锁中毒 |
-| P3 | D `Logger` 注入 / 消灭 `let _ =` | 半天 | 副作用可见 |
+| P3 | D `Logger` 注入 / 消灭 `let _ =` | 半天 | 副作用可见 | ✅ 已完成 |
 
 建议 P0–P1 与依赖精简（报告 01）的对应步骤**合并成同一次改动**：它们动的是同一批函数（`find_server_bin`、`spawn_server`、`stop_server_gracefully`、`wait_ready`），分开改会重复返工。
 
