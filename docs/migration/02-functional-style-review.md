@@ -19,6 +19,25 @@
 > - **D（`Logger` 注入 / 消灭所有 `let _ =`）** —— 收益低于其改动面，留待后续。
 >
 > 依赖精简（报告 01）整体搁置，待本文全部收尾后启动。
+>
+> **rust-skills 复查（leonardomso/rust-skills，265 条规则）**
+>
+> 装好该 skill 后对照重查，又落了一轮改动（同一分支，未单独开 commit 前累积）：
+>
+> - **`anti-empty-catch` / `err-result-over-panic`**：新增 `best_effort(what, result)`
+>   替代约 20 处静默 `let _ =`（`tray_log` 自身、`supervisor` 回包、`JoinHandle::join`
+>   三处保留 `let _ =` 并标注 `// INTENTIONAL`：要么无错误可暴露，要么无上层可传播）。
+>   `sysinfo::Process::kill()` 返回 `bool` 而非 `Result`，直接调用并标注 `// INTENTIONAL`，
+>   不强行塞进 `best_effort`。这等于把 D 的"消灭 `let _ =`"做了一半——日志可见，但
+>   未做 `Logger` 注入。
+> - **`err-expect-bugs-only` / `anti-unwrap-abuse`**：`TrayError` 去掉全部 stringly-typed
+>   变体（`Icon(String)` / `Menu(String)` / `Url(String)`），改为类型化
+>   `Decode(png::DecodingError)` / `IconFormat { color, depth }` / `Url(Box<dyn Error+Send+Sync>)`
+>   / `Tauri(tauri::Error)`；`decode_tray_icon` 改用 `?` 传播而非 `.expect`/`panic!`。
+> - **`own-slice-over-vec`**：`server_bin_candidates` 由分配 `Vec` 改为惰性
+>   `impl Iterator<Item = PathBuf>`，调用方命中即短路，失败路径才 `collect` 一次用于留痕。
+> - `cargo clippy --all-targets` 零警告，14 个单测全绿，默认 `cargo build` 通过。
+>   （注：工作副本 CRLF 会在下次 Git 触碰时被规范化为 LF，属正常。）
 
 ---
 
