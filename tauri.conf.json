@@ -4,7 +4,6 @@
   "version": "0.1.0",
   "identifier": "com.suwayomi.tray",
   "build": {
-    "frontendDist": "frontend"
   },
   "app": {
     "withGlobalTauri": true,

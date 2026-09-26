@@ -2,6 +2,6 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "default capability for the Suwayomi tray window",
-  "windows": ["main"],
+  "windows": ["settings", "webui"],
   "permissions": ["core:default"]
 }

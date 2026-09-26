@@ -28,6 +28,17 @@
 | Linux x64 | 453 | **379** | −74（−16%） |
 | macOS | 327 | **307** | −20（−6%） |
 
+> **实施状态（2026-09-26，refactor/fp-style 分支）**
+>
+> 用户拍板：只落地 **3.1 / 4.1 / 4.2**，其余推迟。
+>
+> - **3.1 ✅ 已做**：关掉 `tauri/compression`（`default-features = false` + 显式 feature 列表）。Windows 实测 crate 数 329 → **323**（−6，`brotli` 全栈消失），与本文一致。
+> - **4.2 ✅ 已做**：`tauri.conf.json` 的 `frontendDist` 死配置已删；`generate_context!` 不依赖它，构建正常。
+> - **4.1 ✅ 已做**：`capabilities/default.json` 的 `windows` 从不存在的 `["main"]` 改为 `["settings", "webui"]`，消除定时炸弹。
+> - **3.2 / 3.3 ⏸ 推迟**：移除 `sysinfo`、移除 `tauri-plugin-single-instance` 暂不实施（收益/风险待定，非当前优先级）。
+> - **3.4 已在 02 §H 完成**：`png` 挪到 `[build-dependencies]`，托盘图标编译期解码。
+> - 顺带：托盘菜单「启动/重启 Suwayomi」改为「…Suwayomi 服务」，更准确地表达"拉起的是 server 服务"。
+
 ---
 
 ## 2. 逐个依赖的"真实成本"
@@ -102,7 +113,7 @@ tauri = { version = "2", default-features = false,
 
 > 注意：必须保留 `wry`（否则没有 WebView 运行时）、`tray-icon`、`common-controls-v6`（Windows 菜单视觉样式）。`dynamic-acl` 是空 feature，零成本但影响运行时权限模型，保留现状最安全。
 
-### 3.2 ✅ 建议：移除 `sysinfo`，用标准库重写（−14 / −6 / −6，风险中）
+### 3.2 ⏸ 已推迟：移除 `sysinfo`，用标准库重写（−14 / −6 / −6，风险中）
 
 现有两个函数：
 
@@ -141,7 +152,7 @@ fn force_kill_server(child: &mut Option<std::process::Child>) {
 
 **副作用**：`server_running` 现在是纯函数 `port_open`，`stop_server_gracefully` / `wait_ready` 也跟着变纯（配合 §3.5 的 `poll_until`），顺带解决 §4 里"同一逻辑写两遍"的问题。
 
-### 3.3 ⚠️ 视平台决定：移除 `tauri-plugin-single-instance`（−10 / **−62** / −8，风险中高）
+### 3.3 ⏸ 已推迟：移除 `tauri-plugin-single-instance`（−10 / **−62** / −8，风险中高）
 
 零依赖替代方案（约 40 行，仅用 `std::net`）：
 

@@ -863,7 +863,7 @@ impl TrayAction {
     /// 静态菜单文字；`Start` 的文案随 server 状态变化，见 `start_label`
     fn label(self) -> &'static str {
         match self {
-            Self::Start => "启动 Suwayomi",
+            Self::Start => "启动 Suwayomi 服务",
             Self::OpenWebUi => "打开 WebUI",
             Self::OpenData => "打开数据目录",
             Self::Settings => "设置",
@@ -884,9 +884,9 @@ impl FromStr for TrayAction {
 /// 「启动/重启」项始终可点：运行中 = 重启，未运行 = 启动
 fn start_label(running: bool) -> &'static str {
     if running {
-        "重启 Suwayomi"
+        "重启 Suwayomi 服务"
     } else {
-        "启动 Suwayomi"
+        "启动 Suwayomi 服务"
     }
 }
 
@@ -1157,7 +1157,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     );
     let tray = TrayIconBuilder::with_id("main")
         .menu(&menu)
-        .tooltip("Suwayomi")
+        .tooltip("Suwayomi 服务")
         .show_menu_on_left_click(false)
         .icon(icon);
 
