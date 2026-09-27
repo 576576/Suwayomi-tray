@@ -1,9 +1,10 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Suwayomi Tray",
-  "version": "1.0.35",
+  "version": "0.1.0",
   "identifier": "com.suwayomi.tray",
-  "build": {},
+  "build": {
+  },
   "app": {
     "withGlobalTauri": true,
     "windows": [],
