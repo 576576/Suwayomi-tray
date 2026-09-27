@@ -4,6 +4,8 @@
 # 这些类型必须保持 LF：shell 脚本带 CR 会让 Linux runner 上的 shebang 失效，
 # workflow 与源码走 CRLF 也只在别的平台才炸，统一钉死省得排查。
 *.sh text eol=lf
+# 钩子脚本没有扩展名，`* text=auto` 不保证 LF；CR 会让 sh 读不出 shebang，钩子静默失效。
+.githooks/* text eol=lf
 *.rs text eol=lf
 *.toml text eol=lf
 *.yml text eol=lf

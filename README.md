@@ -27,6 +27,18 @@ SUWAYOMI_TRAY_VERSION=1.0.23 bash build-tray.sh
 
 版本号必须是三段 semver（会注入 `tauri.conf.json`，Windows 上还进 PE 版本资源）。不传时按本仓库的提交数推算，规则同 CI。
 
+注入是**临时**的：脚本编译前改写 `tauri.conf.json`、编译后还原。仓库里这个字段应保持与 `Cargo.toml` 的 `package.version` 一致，`.githooks/pre-commit` 会拦住注入残留（见「提交前钩子」）。
+
+## 提交前钩子
+
+`tauri.conf.json` 的 `version` 是构建期注入位。本地构建期间这个字段会短暂变成真实版本号，若此时提交 —— GitHub Desktop 会把工作区里所有改动一并列出 —— 注入结果就进了仓库（`0358f3a` 即此，已 revert）。
+
+`.githooks/pre-commit` 校验它与 `Cargo.toml` 的 `package.version` 相等，不等即视为注入残留、拒绝提交。只比对这两个版本号，`sh` + `sed`/`awk`，无额外依赖。启用（每个克隆做一次）：
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## 版本号
 
 `versionCode = 提交数 + 1000`，版本名 `1.{提交数/100}.{提交数%100}`。

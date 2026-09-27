@@ -1,0 +1,42 @@
+#!/bin/sh
+# 提交护栏：tauri.conf.json 的 version 是**构建期注入位** —— build-tray.sh 编译前写入
+# 版本名、编译后还原（trap restore）。仓库里的这个字段应与 Cargo.toml 的
+# package.version 一致；两者不等就说明某次本地构建的注入结果被留在了工作区。
+#
+# 起因：本地构建期间该字段被临时改写，GitHub Desktop 把它当用户改动提交，
+# 版本号 1.0.35 进了 main（0358f3a，已 revert）。
+#
+# 「两处必须相等」这条刚好只拦注入残留：build-tray.sh 只改 json、不改 Cargo.toml，
+# 所以正常改动（同时改两处、或都不改）不会被误伤。
+set -eu
+
+conf=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' tauri.conf.json | head -n 1)
+
+cargo_v=$(awk '
+    /^\[package\]/ { in_pkg = 1; next }
+    /^\[/          { in_pkg = 0 }
+    in_pkg && /^version[[:space:]]*=/ {
+        line = $0
+        sub(/^version[[:space:]]*=[[:space:]]*/, "", line)
+        gsub(/["[:space:]]/, "", line)
+        print line
+        exit
+    }
+' Cargo.toml)
+
+if [ -z "$conf" ] || [ -z "$cargo_v" ]; then
+    echo "pre-commit：解析版本号失败（tauri.conf.json='${conf}'，Cargo.toml='${cargo_v}'）" >&2
+    exit 1
+fi
+
+if [ "$conf" != "$cargo_v" ]; then
+    cat >&2 <<MSG
+pre-commit 拒绝提交：tauri.conf.json 的 version（$conf）与 Cargo.toml 的 package.version（$cargo_v）不一致。
+
+  tauri.conf.json 的 version 是构建期注入位：build-tray.sh 编译前改写、编译后还原。
+  两者不等 = 某次本地构建的注入结果被留在了工作区。
+
+  修：git checkout -- tauri.conf.json
+MSG
+    exit 1
+fi
