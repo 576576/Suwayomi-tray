@@ -230,13 +230,10 @@ fn server_env(data: &Path, port: u16, base: &Path, appdata: &Path) -> Vec<(Strin
             "SUWAYOMI_APPDATA_DIR".into(),
             appdata.as_os_str().to_os_string(),
         ),
-        // 数据目录必须按解析结果显式传：server 自己的兜底是从 cwd 拼
-        // `<cwd>/data/local`，而 cwd 已经设成 data，会解析成 `<data>/data/local`
+        // 数据目录必须按解析结果显式传：server 自己的兜底链是 env → exe 发布布局 →
+        // `cwd/data`，而 cwd 已经设成 data，最后那档会推成 `<data>/data`。
+        // 下载 / 本地图源 / 自动备份都在这个根之下，没有各自的变量。
         ("SUWAYOMI_DATA_DIR".into(), data.as_os_str().to_os_string()),
-        (
-            "SUWAYOMI_LOCAL_SOURCE_DIR".into(),
-            data.join("local").into_os_string(),
-        ),
         (
             "SUWAYOMI_WEBUI_DIR".into(),
             base.join("webui").into_os_string(),
@@ -1436,13 +1433,12 @@ mod tests {
             "SUWAYOMI_PORT",
             "SUWAYOMI_APPDATA_DIR",
             "SUWAYOMI_DATA_DIR",
-            "SUWAYOMI_LOCAL_SOURCE_DIR",
             "SUWAYOMI_WEBUI_DIR",
         ] {
             assert!(keys.contains(&k), "missing {k}");
         }
-        // 按目录拆分的变量已经取消：四个可写目录全由 appdata 根派生，多传一个都会
-        // 让 server 侧那条「只有一个可写根」的约束落空。
+        // 目录级旋钮只剩 appdata / data 两个根：按子目录拆分的、以及按用户数据项
+        // （下载 / 本地图源）拆分的变量都不应再传。
         for k in [
             "SUWAYOMI_EXTENSIONS_DIR",
             "SUWAYOMI_JAR_DIR",
@@ -1450,6 +1446,7 @@ mod tests {
             "SUWAYOMI_CACHE_DIR",
             "SUWAYOMI_DB_DIR",
             "SUWAYOMI_LOGS_DIR",
+            "SUWAYOMI_LOCAL_SOURCE_DIR",
         ] {
             assert!(!keys.contains(&k), "不应再传 {k}");
         }
