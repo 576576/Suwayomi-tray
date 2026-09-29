@@ -2,7 +2,7 @@
 //! （Win WebView2 / Linux WebKitGTK / macOS WKWebView）打开 WebUI/设置窗口；
 //! WebView 不可用时回退系统浏览器。无图形会话（Linux）降级为前台跑 server。
 //! 发布布局（exe 同级）：bin/suwayomi-server(.exe) + bin/ext-runtime.jar +
-//! webui/ + data/(工作数据) + db/(SQLite 库，与 data/ 分开) + extensions/。
+//! webui/ + appdata/(程序状态：cache/db/settings/extensions) + data/(工作数据)。
 //!
 //! # 代码组织
 //!
@@ -50,6 +50,17 @@ mod tray_icon {
 
 const DEFAULT_PORT: u16 = 8090;
 const DATA_SUBDIRS: [&str; 3] = ["autobackup", "downloads", "local"];
+
+/// appdata 下 server 会用到的子目录（与 Rust 侧 `AppPaths` 的子路径一一对应）。
+/// 启动前先建出来，省得首启时 server 边跑边造。
+const APPDATA_SUBDIRS: [&str; 5] = [
+    "cache/logs",
+    "db",
+    "settings",
+    "extensions/apk",
+    "extensions/bin",
+];
+
 const SERVER_PROC_NAMES: [&str; 2] = ["suwayomi-server.exe", "suwayomi-server"];
 
 const WEBUI_WINDOW_LABEL: &str = "webui";
@@ -138,10 +149,33 @@ fn base_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// 托盘设置文件：`<发布根>/settings/tray.json`。不放在数据目录里 —— 数据目录本身
-/// 就是这个文件配的，放进去会自相矛盾。
+/// appdata 根 —— 程序自身产生的东西（缓存 / 数据库 / 设置 / 扩展）都挂在它下面，
+/// 与 server 的 `SUWAYOMI_APPDATA_DIR` 同一语义。
+///
+/// 默认 exe 同级的 `appdata/`；可用同名环境变量外指。安装目录只读时要靠它把可写根
+/// 外指，所以这个值必须**显式传给 server**，不能只靠 server 自己推导。
+fn appdata_dir() -> PathBuf {
+    non_empty(std::env::var("SUWAYOMI_APPDATA_DIR").ok())
+        .map_or_else(|| base_dir().join("appdata"), PathBuf::from)
+}
+
+fn ensure_appdata_dirs(appdata: &Path) -> Result<(), TrayError> {
+    APPDATA_SUBDIRS
+        .iter()
+        .try_for_each(|d| std::fs::create_dir_all(appdata.join(d)))?;
+    Ok(())
+}
+
+/// 托盘设置文件：`<appdata>/settings/tray.json`，与 server 的设置（trackers.json、
+/// 源偏好）同一个目录。
 fn settings_path() -> PathBuf {
-    base_dir().join("settings").join("tray.json")
+    appdata_dir().join("settings").join("tray.json")
+}
+
+/// 日志目录：`<appdata>/cache/logs`（server / tray / sandbox 三个日志同处）。与 server
+/// 子进程自己算出来的那个目录是同一个。
+fn logs_dir() -> PathBuf {
+    appdata_dir().join("cache").join("logs")
 }
 
 /// 工作数据目录解析：设置里自定义目录优先，否则 base/data
@@ -182,18 +216,19 @@ fn server_bin_candidates() -> impl Iterator<Item = PathBuf> {
             let in_dir = SERVER_PROC_NAMES.map(|n| dir.join(n));
             in_bin.into_iter().chain(in_dir)
         }))
-        .chain(from_path.flat_map(|dir| {
-            SERVER_PROC_NAMES.map(move |n| dir.join(n))
-        }))
+        .chain(from_path.flat_map(|dir| SERVER_PROC_NAMES.map(move |n| dir.join(n))))
 }
 
 /// 纯：拉起 server 所需的环境变量（顺序无关，便于断言）。
-fn server_env(data: &Path, port: u16, base: &Path, logs: &Path) -> Vec<(String, OsString)> {
+///
+/// 可写根必须显式传：server 自己的兜底是「exe 同级的 `appdata/`」，而安装目录只读时
+/// 那个位置不可写，托盘才知道该指到哪。
+fn server_env(data: &Path, port: u16, base: &Path, appdata: &Path) -> Vec<(String, OsString)> {
     vec![
         ("SUWAYOMI_PORT".into(), port.to_string().into()),
         (
-            "SUWAYOMI_EXTENSIONS_DIR".into(),
-            base.join("extensions").into_os_string(),
+            "SUWAYOMI_APPDATA_DIR".into(),
+            appdata.as_os_str().to_os_string(),
         ),
         // 数据目录必须按解析结果显式传：server 自己的兜底是从 cwd 拼
         // `<cwd>/data/local`，而 cwd 已经设成 data，会解析成 `<data>/data/local`
@@ -201,10 +236,6 @@ fn server_env(data: &Path, port: u16, base: &Path, logs: &Path) -> Vec<(String, 
         (
             "SUWAYOMI_LOCAL_SOURCE_DIR".into(),
             data.join("local").into_os_string(),
-        ),
-        (
-            "SUWAYOMI_LOGS_DIR".into(),
-            logs.as_os_str().to_os_string(),
         ),
         (
             "SUWAYOMI_WEBUI_DIR".into(),
@@ -298,13 +329,18 @@ impl Serialize for TrayError {
 
 // ─────────────────────────── 4. 副作用薄壳 ───────────────────────────
 
-/// 调试日志：写入 cache/logs/tray.log（release GUI 无控制台，eprintln 不可见）。
+/// 调试日志：写入 <appdata>/cache/logs/tray.log（release GUI 无控制台，eprintln 不可见）。
 /// 每条日志重新 open→写→关闭，故意不用 BufWriter：崩溃强杀时缓冲区内容会一起丢；
 /// 目录只在首次 open 失败时才补建，避免每条日志都白跑一次 create_dir_all。
 fn write_tray_log(msg: &str) {
-    let dir = base_dir().join("cache").join("logs");
+    let dir = logs_dir();
     let path = dir.join("tray.log");
-    let open = || std::fs::OpenOptions::new().create(true).append(true).open(&path);
+    let open = || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+    };
 
     let mut file = match open() {
         Ok(f) => f,
@@ -327,7 +363,7 @@ struct Logger {
 }
 
 impl Logger {
-    /// 默认 sink：写 cache/logs/tray.log（release GUI 无控制台，eprintln 不可见）。
+    /// 默认 sink：写 <appdata>/cache/logs/tray.log（release GUI 无控制台，eprintln 不可见）。
     fn file() -> Self {
         Logger {
             sink: Arc::new(write_tray_log),
@@ -422,13 +458,18 @@ fn kill_server_processes() {
 
 /// 请求 server 优雅关闭（POST loopback /api/v1/shutdown：停 postgres、杀 JVM 沙盒）
 fn request_graceful_shutdown(port: u16, log: &Logger) {
-    log.record(&format!("[tray] requesting graceful shutdown on port {port}"));
+    log.record(&format!(
+        "[tray] requesting graceful shutdown on port {port}"
+    ));
     let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
         return;
     };
     // 超时必须在 read 之前设置，否则 server 不响应时会永久阻塞
     // INTENTIONAL: 尽最大努力通知，未送达还有强杀兜底
-    log.best_effort("set read timeout", stream.set_read_timeout(Some(Duration::from_secs(2))));
+    log.best_effort(
+        "set read timeout",
+        stream.set_read_timeout(Some(Duration::from_secs(2))),
+    );
     let req = format!(
         "POST /api/v1/shutdown HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
@@ -482,11 +523,18 @@ fn ensure_data_dirs(data: &Path) -> Result<(), TrayError> {
     Ok(())
 }
 
-/// `inherit_stdio=true` 前台模式直接继承控制台；否则输出落 cache/logs/server.log
-fn spawn_server(data: &Path, port: u16, inherit_stdio: bool, log: &Logger) -> Result<Child, TrayError> {
+/// `inherit_stdio=true` 前台模式直接继承控制台；否则输出落 <appdata>/cache/logs/server.log
+fn spawn_server(
+    data: &Path,
+    port: u16,
+    inherit_stdio: bool,
+    log: &Logger,
+) -> Result<Child, TrayError> {
     let bin = find_server_bin(log).ok_or(TrayError::ServerNotFound)?;
     let base = base_dir();
-    let logs = base.join("cache").join("logs");
+    let appdata = appdata_dir();
+    ensure_appdata_dirs(&appdata)?;
+    let logs = logs_dir();
     std::fs::create_dir_all(&logs)?;
     let log_file = std::fs::OpenOptions::new()
         .create(true)
@@ -495,7 +543,7 @@ fn spawn_server(data: &Path, port: u16, inherit_stdio: bool, log: &Logger) -> Re
 
     let mut command = Command::new(&bin);
     command.current_dir(data);
-    for (k, v) in server_env(data, port, &base, &logs) {
+    for (k, v) in server_env(data, port, &base, &appdata) {
         command.env(k, v);
     }
     if !inherit_stdio {
@@ -549,7 +597,9 @@ enum SupervisorMsg {
         reply: Sender<Result<(), TrayError>>,
     },
     /// 按当前配置重启
-    Restart { reply: Sender<Result<(), TrayError>> },
+    Restart {
+        reply: Sender<Result<(), TrayError>>,
+    },
     /// 托盘退出后不再关停 server
     Detach { reply: Sender<()> },
     /// 取一份运行时快照
@@ -613,8 +663,10 @@ impl Supervisor {
     /// 退出收尾：通知监督线程停止并等待其退出（唯一一次 join）。
     fn shutdown(&self) {
         // INTENTIONAL: 进程正在退出，断开或失败只能放弃
-        self.log
-            .best_effort("stop supervisor", self.ask(|reply| SupervisorMsg::Shutdown { reply }));
+        self.log.best_effort(
+            "stop supervisor",
+            self.ask(|reply| SupervisorMsg::Shutdown { reply }),
+        );
         let handle = self.thread.lock().ok().and_then(|mut guard| guard.take());
         if let Some(h) = handle {
             // INTENTIONAL: join 返回 Box<dyn Any> 无 Display；panic 时通道已断
@@ -683,7 +735,9 @@ fn apply_settings(state: &mut ActorState, next: Settings) -> Result<(), TrayErro
             Ok(())
         }
         Err(e) => {
-            state.log.record(&format!("[tray] restart after settings change failed: {e}"));
+            state
+                .log
+                .record(&format!("[tray] restart after settings change failed: {e}"));
             Err(e)
         }
     }
@@ -784,7 +838,9 @@ fn open_webui_window(app: &tauri::AppHandle, port: u16) -> bool {
         .on_new_window({
             let log = log.clone();
             move |url, _features| {
-                log.record(&format!("[tray] external link (new window) -> browser: {url}"));
+                log.record(&format!(
+                    "[tray] external link (new window) -> browser: {url}"
+                ));
                 log.best_effort("open in browser", open::that(url.to_string()));
                 tauri::webview::NewWindowResponse::Deny
             }
@@ -890,8 +946,7 @@ fn build_menu(app: &tauri::AppHandle, running: bool) -> Result<Menu<tauri::Wry>,
                 TrayAction::Start => start_label(running),
                 other => other.label(),
             };
-            MenuItem::with_id(app, action.id(), text, true, None::<&str>)
-                .map_err(TrayError::Tauri)
+            MenuItem::with_id(app, action.id(), text, true, None::<&str>).map_err(TrayError::Tauri)
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -1001,7 +1056,10 @@ fn save_settings(
 
 /// 「重启服务端」按钮：用已保存的配置停掉旧 server 并重新拉起（端口/数据目录随之生效）。
 #[tauri::command]
-fn restart_server_cmd(app: tauri::AppHandle, supervisor: State<Supervisor>) -> Result<String, TrayError> {
+fn restart_server_cmd(
+    app: tauri::AppHandle,
+    supervisor: State<Supervisor>,
+) -> Result<String, TrayError> {
     let log = app.state::<Logger>().inner().clone();
     // 端口可能变化，先关掉指向旧端口的 WebUI 窗口
     if let Some(w) = app.get_webview_window(WEBUI_WINDOW_LABEL) {
@@ -1057,9 +1115,7 @@ fn run_server_foreground() -> ! {
     let mut child = match spawn_server(&data, port, true, &log) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!(
-                "{e}.\nPlace it in ./bin/ or set SUWAYOMI_BIN=/path/to/suwayomi-server"
-            );
+            eprintln!("{e}.\nPlace it in ./bin/ or set SUWAYOMI_BIN=/path/to/suwayomi-server");
             std::process::exit(1);
         }
     };
@@ -1333,6 +1389,25 @@ mod tests {
         );
     }
 
+    /// 托盘的设置文件与日志必须落在 appdata 根之下，且子路径与 server 侧一致
+    /// —— 对不上就会变成两个目录各写一半。
+    #[test]
+    fn settings_and_logs_sit_under_the_appdata_root() {
+        let root = appdata_dir();
+        assert_eq!(settings_path(), root.join("settings").join("tray.json"));
+        assert_eq!(logs_dir(), root.join("cache").join("logs"));
+        assert_eq!(
+            APPDATA_SUBDIRS,
+            [
+                "cache/logs",
+                "db",
+                "settings",
+                "extensions/apk",
+                "extensions/bin"
+            ]
+        );
+    }
+
     #[test]
     fn webui_url_is_loopback() {
         assert_eq!(webui_url(8090), "http://127.0.0.1:8090");
@@ -1354,18 +1429,29 @@ mod tests {
             Path::new("/data"),
             1234,
             Path::new("/base"),
-            Path::new("/logs"),
+            Path::new("/appdata"),
         );
         let keys = env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>();
         for k in [
             "SUWAYOMI_PORT",
+            "SUWAYOMI_APPDATA_DIR",
             "SUWAYOMI_DATA_DIR",
             "SUWAYOMI_LOCAL_SOURCE_DIR",
             "SUWAYOMI_WEBUI_DIR",
-            "SUWAYOMI_EXTENSIONS_DIR",
-            "SUWAYOMI_LOGS_DIR",
         ] {
             assert!(keys.contains(&k), "missing {k}");
+        }
+        // 按目录拆分的变量已经取消：四个可写目录全由 appdata 根派生，多传一个都会
+        // 让 server 侧那条「只有一个可写根」的约束落空。
+        for k in [
+            "SUWAYOMI_EXTENSIONS_DIR",
+            "SUWAYOMI_JAR_DIR",
+            "SUWAYOMI_SETTINGS_DIR",
+            "SUWAYOMI_CACHE_DIR",
+            "SUWAYOMI_DB_DIR",
+            "SUWAYOMI_LOGS_DIR",
+        ] {
+            assert!(!keys.contains(&k), "不应再传 {k}");
         }
         let port = env
             .iter()
@@ -1373,6 +1459,12 @@ mod tests {
             .map(|(_, v)| v.clone())
             .unwrap();
         assert_eq!(port, "1234");
+        let appdata = env
+            .iter()
+            .find(|(k, _)| k == "SUWAYOMI_APPDATA_DIR")
+            .map(|(_, v)| v.clone())
+            .unwrap();
+        assert_eq!(appdata, "/appdata");
     }
 
     /// 候选表里绝不能出现托盘自己：server 缺失时会变成 fork 炸弹
