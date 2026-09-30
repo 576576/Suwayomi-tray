@@ -2,7 +2,8 @@
 //! （Win WebView2 / Linux WebKitGTK / macOS WKWebView）打开 WebUI/设置窗口；
 //! WebView 不可用时回退系统浏览器。无图形会话（Linux）降级为前台跑 server。
 //! 发布布局（exe 同级）：bin/suwayomi-server(.exe) + bin/ext-runtime.jar +
-//! webui/ + appdata/(程序状态：cache/db/settings/extensions) + data/(工作数据)。
+//! webui/ + appdata/(程序状态：cache/db/logs/settings/extensions) + data/(工作数据)。
+//! `webui/` 恒在包内（只读资源），另外两个根可被环境变量或安装包预置外指。
 //!
 //! # 代码组织
 //!
@@ -32,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -59,6 +60,12 @@ const SANDBOX_PORT_DEFAULT: u16 = 4568;
 /// 端口嗅探的最大步数：只用来躲开被占 / 被系统保留的端口，不做全端口扫描。
 const PORT_SNIFF_TRIES: u16 = 32;
 const DATA_SUBDIRS: [&str; 3] = ["autobackup", "downloads", "local"];
+
+/// exe 同级的 appdata 根目录名。server 侧 `SUWAYOMI_APPDATA_DIR` 的兜底同名。
+const APPDATA_DIR_NAME: &str = "appdata";
+/// 托盘设置文件在 appdata 根下的相对路径 —— 安装包的预置组件按同一个相对路径投放，
+/// 两处必须一致。
+const TRAY_SETTINGS_REL: &str = "settings/tray.json";
 
 /// appdata 下 server 会用到的子目录（与 Rust 侧 `AppPaths` 的子路径一一对应）。
 /// 启动前先建出来，省得首启时 server 边跑边造。
@@ -155,6 +162,22 @@ fn blank_to_none<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::E
     Ok(non_empty(Option::<String>::deserialize(d)?))
 }
 
+/// 安装包预置的两个根。per-machine 的 msi / setup.exe 随包落一份
+/// `<安装根>\appdata\settings\tray.json`（组件条件
+/// `ALLUSERS = 1 OR (ALLUSERS = 2 AND NOT MSIINSTALLPERUSER)`），把根指到用户目录 ——
+/// 那种安装落在 `Program Files`，普通用户对它没有写权限，首次启动会直接失败。
+///
+/// 两个值都是**默认层**：设置里显式写过的压过它们。路径写环境变量、不写死绝对路径：
+/// per-machine 安装由管理员执行，写死就等于把数据落到管理员的用户目录。
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct PresetSettings {
+    /// appdata 根（程序自身状态：缓存 / 库 / 日志 / 设置 / 扩展）
+    appdata_dir: Option<String>,
+    /// 工作数据根（下载 / 本地图源 / 自动备份都在它之下）
+    data_dir: Option<String>,
+}
+
 // ─────────────────────────── 2. 纯函数 ───────────────────────────
 
 /// 发布布局根目录 = 本 exe 同级
@@ -165,14 +188,50 @@ fn base_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// appdata 根 —— 程序自身产生的东西（缓存 / 数据库 / 设置 / 扩展）都挂在它下面，
+/// 纯：展开字符串里的 `%VAR%`（`lookup` 注入，便于断言）。查不到的变量名、空名字
+/// （`%%`）、以及落单的 `%` 一律返回 `None`，由调用方按「这一项没设置」处理 ——
+/// 照原样返回的话会真的建出一个叫 `%FOO%` 的目录。
+fn expand_vars(s: &str, lookup: impl Fn(&str) -> Option<OsString>) -> Option<OsString> {
+    let mut out = OsString::new();
+    let mut rest = s;
+    while let Some(open) = rest.find('%') {
+        out.push(&rest[..open]);
+        let after = &rest[open + 1..];
+        let name = &after[..after.find('%')?];
+        if name.is_empty() {
+            return None;
+        }
+        out.push(lookup(name)?);
+        rest = &after[name.len() + 1..];
+    }
+    out.push(rest);
+    Some(out)
+}
+
+/// 用进程环境展开 `%VAR%`。Windows 上变量名不区分大小写，这一点由 `var_os` 保证。
+fn expand_env_path(s: &str) -> Option<PathBuf> {
+    expand_vars(s, |n| std::env::var_os(n)).map(PathBuf::from)
+}
+
+/// appdata 根 —— 程序自身产生的东西（缓存 / 数据库 / 日志 / 设置 / 扩展）都挂在它下面，
 /// 与 server 的 `SUWAYOMI_APPDATA_DIR` 同一语义。
 ///
-/// 默认 exe 同级的 `appdata/`；可用同名环境变量外指。安装目录只读时要靠它把可写根
-/// 外指，所以这个值必须**显式传给 server**，不能只靠 server 自己推导。
+/// 优先级：环境变量（显式外指）→ 安装包预置的 `appdataDir` → exe 同级的 `appdata/`。
+/// 安装目录只读时要靠它把可写根外指，所以这个值必须**显式传给 server**，不能只靠 server
+/// 自己推导。
 fn appdata_dir() -> PathBuf {
-    non_empty(std::env::var("SUWAYOMI_APPDATA_DIR").ok())
-        .map_or_else(|| base_dir().join("appdata"), PathBuf::from)
+    appdata_root(
+        non_empty(std::env::var("SUWAYOMI_APPDATA_DIR").ok()),
+        preset(),
+        &base_dir(),
+    )
+}
+
+/// 纯：appdata 根的解析。预置里的 `%VAR%` 在这里按进程环境展开。
+fn appdata_root(env: Option<String>, preset: &PresetSettings, base: &Path) -> PathBuf {
+    env.map(PathBuf::from)
+        .or_else(|| preset.appdata_dir.as_deref().and_then(expand_env_path))
+        .unwrap_or_else(|| base.join(APPDATA_DIR_NAME))
 }
 
 fn ensure_appdata_dirs(appdata: &Path) -> Result<(), TrayError> {
@@ -185,7 +244,14 @@ fn ensure_appdata_dirs(appdata: &Path) -> Result<(), TrayError> {
 /// 托盘设置文件：`<appdata>/settings/tray.json`，与 server 的设置（trackers.json、
 /// 源偏好）同一个目录。
 fn settings_path() -> PathBuf {
-    appdata_dir().join("settings").join("tray.json")
+    appdata_dir().join(TRAY_SETTINGS_REL)
+}
+
+/// 安装包预置文件的落点：exe 同级的 `<appdata>/settings/tray.json` —— 与上面**同名同址**。
+/// 只有 per-machine 安装（安装目录不可写）下那份才存在，那时用户设置写在
+/// `%LOCALAPPDATA%\Suwayomi`，两者不会互相覆盖。
+fn preset_settings_path() -> PathBuf {
+    base_dir().join(APPDATA_DIR_NAME).join(TRAY_SETTINGS_REL)
 }
 
 /// 日志目录：`<appdata>/logs`（server / tray / sandbox 三个日志同处）。与 server
@@ -194,12 +260,17 @@ fn logs_dir() -> PathBuf {
     appdata_dir().join("logs")
 }
 
-/// 工作数据目录解析：设置里自定义目录优先，否则 base/data
+/// 工作数据目录解析：设置里的自定义目录 → 预置的 `dataDir` → `<exe 同级>/data`
 fn data_dir_of(s: &Settings) -> PathBuf {
-    match s.data_dir.as_deref() {
-        Some(d) => PathBuf::from(d),
-        None => base_dir().join("data"),
-    }
+    data_root(s.data_dir.as_deref(), preset(), &base_dir())
+}
+
+/// 纯：数据根的解析（同 `appdata_root`）。设置里手写的值也允许用 `%VAR%`。
+fn data_root(override_dir: Option<&str>, preset: &PresetSettings, base: &Path) -> PathBuf {
+    override_dir
+        .and_then(expand_env_path)
+        .or_else(|| preset.data_dir.as_deref().and_then(expand_env_path))
+        .unwrap_or_else(|| base.join("data"))
 }
 
 /// 纯：`host` / `host:port` / `[v6]:port` → host 部分（源比对用）。
@@ -484,6 +555,40 @@ impl Logger {
         if let Err(e) = result {
             self.record(&format!("[tray] {what}: {e}"));
         }
+    }
+}
+
+/// 预置文件的读取结果：设置 + 值得留痕的原因。**这里不写日志** —— 日志目录由 appdata 根
+/// 推出，而那个根正要用这份结果，在日志里绕一圈会回到这里。留痕由 `log_preset_warning`
+/// 在启动时补一次。
+fn preset_state() -> &'static (PresetSettings, Option<String>) {
+    static STATE: OnceLock<(PresetSettings, Option<String>)> = OnceLock::new();
+    STATE.get_or_init(|| {
+        let path = preset_settings_path();
+        match std::fs::read_to_string(&path) {
+            // 没有预置文件是正常状态：绿色版、per-user 安装、MSIX
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (PresetSettings::default(), None),
+            Err(e) => (PresetSettings::default(), Some(format!("读取失败（{e}）"))),
+            Ok(text) => match serde_json::from_str::<PresetSettings>(&text) {
+                Ok(p) => (p, None),
+                Err(e) => (PresetSettings::default(), Some(format!("解析失败（{e}）"))),
+            },
+        }
+    })
+}
+
+/// 进程内固定的那一份预置设置（文件只读一次）。
+fn preset() -> &'static PresetSettings {
+    &preset_state().0
+}
+
+/// 启动时留痕一次：预置文件在、但读不出来时，用户看到的是「预置没生效」。
+fn log_preset_warning(log: &Logger) {
+    if let Some(why) = &preset_state().1 {
+        log.record(&format!(
+            "[tray] WARN: {} {why}，忽略预置设置",
+            preset_settings_path().display()
+        ));
     }
 }
 
@@ -1307,6 +1412,7 @@ fn has_graphical_session() -> bool {
 fn run_server_foreground() -> ! {
     // 无图形会话降级路径没有 AppHandle 可托管 Logger，直接用默认文件 sink 注入
     let log = Logger::file();
+    log_preset_warning(&log);
     let settings = load_settings(&log);
     let Ok(ports) = pick_ports(&settings, |_| false, &log) else {
         eprintln!("configured port is unavailable; change it in tray settings");
@@ -1371,6 +1477,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // Logger 作为托管依赖注入：后续用 `app.state::<Logger>()` 取出
     app.manage(Logger::file());
     let log = app.state::<Logger>().inner().clone();
+    log_preset_warning(&log);
 
     let settings = load_settings(&log);
     let data = data_dir_of(&settings);
@@ -1560,6 +1667,7 @@ fn try_main() -> Result<(), TrayError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     fn settings(json: &str) -> Settings {
         serde_json::from_str::<Settings>(json).expect("parse settings")
@@ -1734,10 +1842,91 @@ mod tests {
 
     #[test]
     fn data_dir_defaults_under_base() {
-        assert_eq!(data_dir_of(&Settings::default()), base_dir().join("data"));
+        // 设置里写死的目录与预置无关，在哪台机器上都一样
         assert_eq!(
             data_dir_of(&settings(r#"{"dataDir": "/srv/manga"}"#)),
             PathBuf::from("/srv/manga")
+        );
+        // 没写时才轮到默认层
+        assert_eq!(
+            data_root(None, &PresetSettings::default(), &base_dir()),
+            base_dir().join("data")
+        );
+    }
+
+    /// `%VAR%` 展开：查不到的变量名一律当作"没设置" —— 照原样留下会让托盘真的建出一个
+    /// 叫 `%FOO%` 的目录。
+    #[test]
+    fn expand_vars_resolves_known_names_and_rejects_the_rest() {
+        let lookup =
+            |n: &str| (n == "LOCALAPPDATA").then(|| OsString::from(r"C:\Users\me\AppData\Local"));
+        assert_eq!(
+            expand_vars(r"%LOCALAPPDATA%\Suwayomi", lookup).as_deref(),
+            Some(OsStr::new(r"C:\Users\me\AppData\Local\Suwayomi"))
+        );
+        // 没有变量的、有多个变量的
+        assert_eq!(
+            expand_vars("/srv/manga", lookup).as_deref(),
+            Some(OsStr::new("/srv/manga"))
+        );
+        assert_eq!(
+            expand_vars("%A%-%B%", |n| Some(OsString::from(n))).as_deref(),
+            Some(OsStr::new("A-B"))
+        );
+        // 未定义变量 / 空名字（`%%`） / 落单的 `%`
+        assert!(expand_vars(r"%FOO%\Suwayomi", lookup).is_none());
+        assert!(expand_vars("a%%b", lookup).is_none());
+        assert!(expand_vars("100%", lookup).is_none());
+    }
+
+    /// 预置的两个根只是**默认层**：设置里显式写过的一律优先，用户改过之后以那份为准。
+    #[test]
+    fn preset_roots_are_defaults_behind_the_settings() {
+        let preset = PresetSettings {
+            appdata_dir: Some(r"C:\Users\me\AppData\Local\Suwayomi".into()),
+            data_dir: Some(r"C:\Users\me\Pictures\Suwayomi".into()),
+        };
+        assert_eq!(
+            appdata_root(None, &preset, Path::new("/base")),
+            PathBuf::from(r"C:\Users\me\AppData\Local\Suwayomi")
+        );
+        // 环境变量是显式外指，仍压过预置
+        assert_eq!(
+            appdata_root(Some("/opt/suwayomi".into()), &preset, Path::new("/base")),
+            PathBuf::from("/opt/suwayomi")
+        );
+        assert_eq!(
+            data_root(None, &preset, Path::new("/base")),
+            PathBuf::from(r"C:\Users\me\Pictures\Suwayomi")
+        );
+        assert_eq!(
+            data_root(Some("/srv/manga"), &preset, Path::new("/base")),
+            PathBuf::from("/srv/manga")
+        );
+    }
+
+    /// 没有预置文件（绿色版 / per-user 安装 / MSIX）时，两个根与从前完全一样。
+    #[test]
+    fn missing_preset_keeps_the_built_in_roots() {
+        let none = PresetSettings::default();
+        assert_eq!(
+            appdata_root(None, &none, Path::new("/base")),
+            Path::new("/base").join(APPDATA_DIR_NAME)
+        );
+        assert_eq!(
+            data_root(None, &none, Path::new("/base")),
+            Path::new("/base").join("data")
+        );
+    }
+
+    /// 预置文件与用户设置文件同名同址 —— 安装包的预置组件按这个相对路径投放，
+    /// 两边对不上就是"预置装了但没人读"。
+    #[test]
+    fn preset_file_sits_where_the_settings_file_would_be() {
+        assert_eq!(TRAY_SETTINGS_REL, "settings/tray.json");
+        assert_eq!(
+            preset_settings_path(),
+            base_dir().join(APPDATA_DIR_NAME).join(TRAY_SETTINGS_REL)
         );
     }
 
