@@ -1,0 +1,68 @@
+name: Lint
+
+# 质量门禁：格式 / 静态检查 / 测试。
+#
+# **不跟 push / PR**：由 release.yml 在调用 build 之前作为一个 job 调起（`workflow_call`），
+# 所以发布链路上没有任何一道能绕过它；只跑它一个用 workflow_dispatch。
+# 与主仓 Suwayomi-next 的 lint.yml 同款拆法。
+on:
+  workflow_call:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    # 只用 rustfmt，不编译，所以不装系统依赖。
+    steps:
+      - uses: actions/checkout@v7
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: 检查格式
+        # 本仓库没有 rustfmt.toml，用 rustfmt 默认档（主仓那份是 max_width=120 的自定义档）。
+        run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: 安装系统依赖（Linux）
+        # clippy 会真的把依赖编一遍：tauri 这一支在 Linux 上要过 glib-sys / gtk-sys /
+        # webkit2gtk-sys / javascriptcore-rs-sys / soup3-sys / libappindicator-sys /
+        # gdk-sys 的构建脚本，它们靠 pkg-config 找头文件 —— 缺了这一步会在编依赖时就
+        # 报错。与 build.yml 的 Linux 步骤同一行，两处必须一致（改一处要改两处）。
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev
+      - name: 静态检查
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: 安装系统依赖（Linux）
+        # 同 clippy：cargo test 也要先把依赖编出来。
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev
+      - name: 测试
+        # --no-fail-fast：默认在第一个失败的测试二进制处就收工，一轮要拿到全部失败。
+        run: cargo test --workspace --no-fail-fast
