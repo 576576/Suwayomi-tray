@@ -19,7 +19,7 @@
 >   `[build-dependencies]`），并删掉了 `decode_tray_icon` 与 `TrayError` 的
 >   `Decode` / `IconFormat` 变体。图标格式错误现在是**构建错误**而非运行时 panic。
 > - **D（`Logger` 注入）** —— 已做。新增 `Logger` 类型（`Arc<dyn Fn>` 可替换 sink，
->   默认 sink 写 `cache/logs/tray.log`），经 `app.manage(Logger::file())` 注入，各处用
+>   默认 sink 写 `logs/tray.log`），经 `app.manage(Logger::file())` 注入，各处用
 >   `app.state::<Logger>()` 取出；无 `AppHandle` 的纯函数 / actor 线程 / 无图形会话
 >   降级路径，则把 `&Logger` 作为参数显式传入。`tray_log` 自由函数已删除，
 >   `best_effort` 改为 `Logger` 的方法。"会写磁盘"这个副作用从隐式全局变成显式依赖。
@@ -230,7 +230,7 @@ fn stop_server_gracefully(port: u16) {
 - 对吞错的地方：要么返回 `Result` 往上传播，要么显式收集成 `Vec<Warning>` 一起返回——不要 `let _ =`。
 
 > **实施（refactor/fp-style）：已落地。** 自由函数 `tray_log` 删除，改为可注入的
-> `Logger`（`Arc<dyn Fn>` sink，默认写 `cache/logs/tray.log`），经 `app.manage(Logger::file())`
+> `Logger`（`Arc<dyn Fn>` sink，默认写 `logs/tray.log`），经 `app.manage(Logger::file())`
 > 注入、`app.state::<Logger>()` 取出；无 `AppHandle` 的纯函数 / actor 线程 / 无图形会话
 > 降级路径，把 `&Logger` 作为参数显式传入；`best_effort` 成为 `Logger` 的方法。
 > 约 20 处 `let _ =` 已被 `best_effort` 替换，仅剩三处保留并标注 `// INTENTIONAL`。

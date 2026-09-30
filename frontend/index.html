@@ -40,7 +40,12 @@
     <h3>Suwayomi 托盘设置</h3>
 
     <label for="port">服务器端口</label>
-    <input id="port" type="number" min="1" max="65535" />
+    <input id="port" type="number" min="1" max="65535" placeholder="自动" />
+    <div class="hint" id="port-hint"></div>
+
+    <label for="server-address">服务器地址</label>
+    <input id="server-address" type="text" placeholder="留空 = 本机" />
+    <div class="hint">留空 = 本机回环 + 上面的端口；也可填局域网/远程地址（如 192.168.1.10 或 http://nas:4567）。</div>
 
     <label for="data-dir">工作数据目录</label>
     <input id="data-dir" type="text" placeholder="默认" />
@@ -83,7 +88,11 @@
       window.addEventListener("DOMContentLoaded", async () => {
         try {
           const s = await invoke("get_settings");
-          document.getElementById("port").value = s.serverPort;
+          // 空 = 自动：留空就是「让托盘挑一个能绑的端口」，不写死具体数字
+          document.getElementById("port").value = s.serverPort ?? "";
+          document.getElementById("port-hint").textContent =
+            "当前实际端口: " + s.effectivePort + "。留空 = 自动（默认 4567，被占用或被系统保留则顺延）";
+          document.getElementById("server-address").value = s.serverAddress || "";
           document.getElementById("data-dir").value = s.dataDirOverride || "";
           document.getElementById("current").textContent = "当前目录: " + s.dataDir;
           document.getElementById("open-webui-on-startup").checked = s.openWebUiOnStartup;
@@ -95,13 +104,19 @@
       });
 
       document.getElementById("save").onclick = async () => {
-        const p = parseInt(document.getElementById("port").value, 10);
-        if (!p || p < 1 || p > 65535) { document.getElementById("msg").textContent = "端口无效"; return; }
+        const raw = document.getElementById("port").value.trim();
+        // 留空 → null（自动档）
+        const p = raw === "" ? null : parseInt(raw, 10);
+        if (raw !== "" && (!Number.isInteger(p) || p < 1 || p > 65535)) {
+          document.getElementById("msg").textContent = "端口无效（1-65535，或留空自动）";
+          return;
+        }
         const dd = document.getElementById("data-dir").value.trim();
+        const sa = document.getElementById("server-address").value.trim();
         const ow = document.getElementById("open-webui-on-startup").checked;
         const pe = document.getElementById("prefer-web-view").checked;
         try {
-          await invoke("save_settings", { serverPort: p, dataDir: dd, openWebUiOnStartup: ow, preferWebView: pe });
+          await invoke("save_settings", { serverPort: p, serverAddress: sa || null, dataDir: dd, openWebUiOnStartup: ow, preferWebView: pe });
           document.getElementById("current").textContent = "当前目录: " + (dd || "默认");
           document.getElementById("msg").textContent = "已保存，点击「重启服务端」生效";
         } catch (e) {
@@ -113,6 +128,11 @@
           const url = await invoke("restart_server_cmd");
           document.getElementById("url").textContent = "WebUI: " + url;
           document.getElementById("msg").textContent = "服务端已重启";
+          const s = await invoke("get_settings");
+          document.getElementById("port").value = s.serverPort ?? "";
+          document.getElementById("server-address").value = s.serverAddress || "";
+          document.getElementById("port-hint").textContent =
+            "当前实际端口: " + s.effectivePort + "。留空 = 自动（默认 4567，被占用或被系统保留则顺延）";
         } catch (e) {
           document.getElementById("msg").textContent = "重启失败: " + e;
         }

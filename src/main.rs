@@ -8,8 +8,8 @@
 //!
 //! 按「纯内核 + 副作用外壳」分层，自上而下：
 //!
-//! 1. **配置与纯函数**（`Settings` / `SettingsPatch` / `server_env` / `webui_url` …）
-//!    —— 不碰 I/O，可独立断言。
+//! 1. **配置与纯函数**（`Settings` / `SettingsPatch` / `resolve_ports` / `server_env`
+//!    / `webui_url` …）—— 不碰 I/O，可独立断言。
 //! 2. **副作用薄壳**（`spawn_server` / `request_graceful_shutdown` / `Logger` …）
 //!    —— 只做 I/O，不含业务判断。
 //! 3. **监督者 actor**（`Supervisor`）—— server 子进程的唯一所有者，外部只能发消息。
@@ -24,6 +24,7 @@
 //! 裸 `let _ =` 仅保留在三处并带 `// INTENTIONAL:` 说明理由。
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -48,13 +49,22 @@ mod tray_icon {
 
 // ─────────────────────────────── 常量 ───────────────────────────────
 
-const DEFAULT_PORT: u16 = 8090;
+/// 没在设置里指定端口时用的默认值，与 server 的默认值（`ServerConfig::default`）一致。
+/// Windows 上它落在 Hyper-V 动态保留区（4501-4900，bind 报 10013）里，所以自动档
+/// 一律要嗅探（见 `resolve_ports`）。
+const DEFAULT_PORT: u16 = 4567;
+/// 沙盒（ext-runtime JVM）端口的嗅探起点：紧邻 server 默认端口的下一格。
+/// 两者同处 Hyper-V 保留区，所以这一格同样要靠嗅探（见 `resolve_ports`）。
+const SANDBOX_PORT_DEFAULT: u16 = 4568;
+/// 端口嗅探的最大步数：只用来躲开被占 / 被系统保留的端口，不做全端口扫描。
+const PORT_SNIFF_TRIES: u16 = 32;
 const DATA_SUBDIRS: [&str; 3] = ["autobackup", "downloads", "local"];
 
 /// appdata 下 server 会用到的子目录（与 Rust 侧 `AppPaths` 的子路径一一对应）。
 /// 启动前先建出来，省得首启时 server 边跑边造。
-const APPDATA_SUBDIRS: [&str; 5] = [
-    "cache/logs",
+const APPDATA_SUBDIRS: [&str; 6] = [
+    "cache",
+    "logs",
     "db",
     "settings",
     "extensions/apk",
@@ -81,7 +91,13 @@ const SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(35);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", from = "SettingsPatch")]
 struct Settings {
-    server_port: u16,
+    /// 端口：`None` = 没指定，由托盘在启动前嗅探（默认 4567，被占则向上顺延）；
+    /// `Some` = 用户写死的端口，必须照用 —— 他可能按这个端口配了防火墙/端口转发，
+    /// 悄悄换掉等于把服务藏到别处。
+    server_port: Option<u16>,
+    /// WebUI 打开的目标地址（host、host:port 或完整 URL）。
+    /// `None` = 本机回环 + 实际端口，与没有这个设置时完全一样。
+    server_address: Option<String>,
     data_dir: Option<String>,
     open_web_ui_on_startup: bool,
     prefer_web_view: bool,
@@ -97,6 +113,8 @@ struct Settings {
 struct SettingsPatch {
     server_port: Option<u16>,
     #[serde(deserialize_with = "blank_to_none")]
+    server_address: Option<String>,
+    #[serde(deserialize_with = "blank_to_none")]
     data_dir: Option<String>,
     open_web_ui_on_startup: Option<bool>,
     prefer_web_view: Option<bool>,
@@ -106,11 +124,9 @@ impl SettingsPatch {
     /// 纯：把「用户可能只写了一半」的配置折叠到默认值上。
     fn finish(self) -> Settings {
         Settings {
-            // 非法端口回落到默认值，而不是 clamp 出一个用户没写过的数字
-            server_port: self
-                .server_port
-                .filter(|p| (1..=65535).contains(p))
-                .unwrap_or(DEFAULT_PORT),
+            // 非法端口当作没写，而不是 clamp 出一个用户没写过的数字
+            server_port: self.server_port.filter(|p| (1..=65535).contains(p)),
+            server_address: non_empty(self.server_address),
             data_dir: non_empty(self.data_dir),
             open_web_ui_on_startup: self.open_web_ui_on_startup.unwrap_or(true),
             prefer_web_view: self.prefer_web_view.unwrap_or(true),
@@ -172,10 +188,10 @@ fn settings_path() -> PathBuf {
     appdata_dir().join("settings").join("tray.json")
 }
 
-/// 日志目录：`<appdata>/cache/logs`（server / tray / sandbox 三个日志同处）。与 server
+/// 日志目录：`<appdata>/logs`（server / tray / sandbox 三个日志同处）。与 server
 /// 子进程自己算出来的那个目录是同一个。
 fn logs_dir() -> PathBuf {
-    appdata_dir().join("cache").join("logs")
+    appdata_dir().join("logs")
 }
 
 /// 工作数据目录解析：设置里自定义目录优先，否则 base/data
@@ -186,14 +202,91 @@ fn data_dir_of(s: &Settings) -> PathBuf {
     }
 }
 
-fn webui_url(port: u16) -> String {
-    format!("http://127.0.0.1:{port}")
+/// 纯：`host` / `host:port` / `[v6]:port` → host 部分（源比对用）。
+fn authority_host(authority: &str) -> &str {
+    match authority.strip_prefix('[') {
+        // IPv6 字面量：方括号里本身带冒号，不能按冒号切
+        Some(rest) => rest.split(']').next().unwrap_or(rest),
+        None => authority.split(':').next().unwrap_or(authority),
+    }
 }
 
-/// WebView 内只允许 WebUI 自身源（127.0.0.1/localhost）的顶层导航
-fn is_webui_origin(url: &tauri::Url) -> bool {
-    matches!(url.scheme(), "http" | "https")
-        && matches!(url.host_str(), Some("127.0.0.1") | Some("localhost"))
+/// 纯：WebUI 的目标地址。`address` 留空 = 本机回环 + 实际端口；填了就用它，
+/// 只给 host（不带端口）时补上实际端口 —— 用户往往只想换机器，不想换端口。
+fn webui_url(address: Option<&str>, port: u16) -> String {
+    let Some(addr) = address.map(str::trim).filter(|a| !a.is_empty()) else {
+        return format!("http://127.0.0.1:{port}");
+    };
+    let (scheme, rest) = addr.split_once("://").unwrap_or(("http", addr));
+    let authority = rest.split('/').next().unwrap_or(rest);
+    // 只有 IPv6 字面量自带冒号，那种形式必须看到 `]:` 才算带了端口
+    let has_port = if authority.starts_with('[') {
+        authority.contains("]:")
+    } else {
+        authority.contains(':')
+    };
+    if has_port {
+        format!("{scheme}://{authority}")
+    } else {
+        format!("{scheme}://{authority}:{port}")
+    }
+}
+
+/// 本次运行实际使用的端口对。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ports {
+    /// server 的 HTTP 端口：设置里写死的那个，或自动档嗅探所得。
+    server: u16,
+    /// ext-runtime JVM 的端口。恒不等于 `server` —— 沙盒启动时会清掉占用者
+    /// （`SandboxProcess::start`），撞上就是 server 被自己拉起的沙盒杀掉。
+    sandbox: u16,
+}
+
+/// 从 `from` 起取第一个 `free` 的端口，最多试 `tries` 个（到 65535 为止）。
+fn first_free_port(from: u16, tries: u16, free: impl Fn(u16) -> bool) -> Option<u16> {
+    (0..tries)
+        .map_while(|i| from.checked_add(i))
+        .find(|p| free(*p))
+}
+
+/// 纯：端口对。`None` = 写死的端口用不了，或自动档下 [`PORT_SNIFF_TRIES`] 个候选
+/// 全被占 —— 两种情况调用方都该报错，而不是硬塞一个：写死的端口被换掉后，用户按
+/// 原端口配的防火墙/端口转发全部失效，且界面上看不出服务搬去了哪。
+/// `free` 由调用方注入（真实实现是「能不能 bind」），便于断言。
+fn resolve_ports(requested: Option<u16>, free: impl Fn(u16) -> bool) -> Option<Ports> {
+    let server = match requested {
+        Some(p) if free(p) => p,
+        Some(_) => return None,
+        None => first_free_port(DEFAULT_PORT, PORT_SNIFF_TRIES, &free)?,
+    };
+    // 挑不出来就让沙盒自己顺延，而不是拒绝启动：扩展不可用不该挡住书架/阅读
+    let sandbox = first_free_port(SANDBOX_PORT_DEFAULT, PORT_SNIFF_TRIES, |p| {
+        p != server && free(p)
+    })
+    .unwrap_or(SANDBOX_PORT_DEFAULT);
+    Some(Ports { server, sandbox })
+}
+
+/// WebView 内只允许 WebUI 自身源的顶层导航：回环，或设置里指定的那个服务器地址。
+/// 少了后者，指向远端 server 时 WebUI 自身的跳转会被误判成外部链接、丢给系统浏览器。
+fn is_webui_origin(url: &tauri::Url, address: Option<&str>) -> bool {
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if matches!(host, "127.0.0.1" | "localhost") {
+        return true;
+    }
+    address
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .is_some_and(|addr| {
+            let (_, rest) = addr.split_once("://").unwrap_or(("http", addr));
+            let authority = rest.split('/').next().unwrap_or(rest);
+            host.eq_ignore_ascii_case(authority_host(authority))
+        })
 }
 
 /// 纯：server 二进制的候选路径（按优先级）。不含托盘自身的 exe —— 否则 server
@@ -223,9 +316,15 @@ fn server_bin_candidates() -> impl Iterator<Item = PathBuf> {
 ///
 /// 可写根必须显式传：server 自己的兜底是「exe 同级的 `appdata/`」，而安装目录只读时
 /// 那个位置不可写，托盘才知道该指到哪。
-fn server_env(data: &Path, port: u16, base: &Path, appdata: &Path) -> Vec<(String, OsString)> {
+fn server_env(data: &Path, ports: Ports, base: &Path, appdata: &Path) -> Vec<(String, OsString)> {
     vec![
-        ("SUWAYOMI_PORT".into(), port.to_string().into()),
+        ("SUWAYOMI_PORT".into(), ports.server.to_string().into()),
+        // 沙盒端口由托盘指定：两者默认值相邻，server 的监听端口自顺延时可能正好落到
+        // 沙盒那一格，那样沙盒一启动就会把 server 杀掉（见 `SandboxProcess::start`）。
+        (
+            "SUWAYOMI_SANDBOX_PORT".into(),
+            ports.sandbox.to_string().into(),
+        ),
         (
             "SUWAYOMI_APPDATA_DIR".into(),
             appdata.as_os_str().to_os_string(),
@@ -268,6 +367,8 @@ enum TrayError {
     /// 固定 URL 解析失败（只可能是常量写错）
     Url(Box<dyn std::error::Error + Send + Sync>),
     InvalidPort(u16),
+    /// 设置里写死的端口用不了（自动档嗅探会绕开，走不到这里）
+    PortUnavailable(u16),
     ServerNotFound,
     /// 监督者线程已退出（或忙到超时），无法应答
     SupervisorDown,
@@ -281,6 +382,11 @@ impl std::fmt::Display for TrayError {
             Self::Tauri(e) => write!(f, "{e}"),
             Self::Url(e) => write!(f, "URL 解析失败: {e}"),
             Self::InvalidPort(p) => write!(f, "端口无效: {p}（应为 1-65535）"),
+            Self::PortUnavailable(p) => write!(
+                f,
+                "端口 {p} 不可用（被占用或被系统保留）。请在设置里换一个端口，\
+                 或清空端口让托盘自动选择"
+            ),
             Self::ServerNotFound => {
                 write!(f, "server 启动失败（找不到 suwayomi-server 可执行文件）")
             }
@@ -326,7 +432,7 @@ impl Serialize for TrayError {
 
 // ─────────────────────────── 4. 副作用薄壳 ───────────────────────────
 
-/// 调试日志：写入 <appdata>/cache/logs/tray.log（release GUI 无控制台，eprintln 不可见）。
+/// 调试日志：写入 <appdata>/logs/tray.log（release GUI 无控制台，eprintln 不可见）。
 /// 每条日志重新 open→写→关闭，故意不用 BufWriter：崩溃强杀时缓冲区内容会一起丢；
 /// 目录只在首次 open 失败时才补建，避免每条日志都白跑一次 create_dir_all。
 fn write_tray_log(msg: &str) {
@@ -360,7 +466,7 @@ struct Logger {
 }
 
 impl Logger {
-    /// 默认 sink：写 <appdata>/cache/logs/tray.log（release GUI 无控制台，eprintln 不可见）。
+    /// 默认 sink：写 <appdata>/logs/tray.log（release GUI 无控制台，eprintln 不可见）。
     fn file() -> Self {
         Logger {
             sink: Arc::new(write_tray_log),
@@ -420,6 +526,34 @@ fn find_server_bin(log: &Logger) -> Option<PathBuf> {
         ));
     }
     found
+}
+
+/// 当前所有 LISTENING 的端口（`netstat -ano` 一次拿全，省得每个候选起一次进程）。
+fn listening_ports() -> HashSet<u16> {
+    let Ok(out) = Command::new("netstat").args(["-ano"]).output() else {
+        // INTENTIONAL: 拿不到就当作「谁都没监听」—— 后面还有试绑兜底
+        return HashSet::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.to_ascii_lowercase().contains("listening"))
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .filter_map(|addr| addr.rsplit(':').next())
+        .filter_map(|p| p.parse::<u16>().ok())
+        .collect()
+}
+
+/// 端口是否可用。两件事都要查，各自都漏：
+///
+/// * **试绑**：Windows 的动态保留段（Hyper-V 把端口段留下自用，bind 直接报 10013）
+///   里一个监听者都没有，只有真的去 bind 才发现它不可用。
+/// * **netstat**：Windows 上 `0.0.0.0:P` 被占时 `127.0.0.1:P` 仍能绑上，而 server
+///   绑的是 `0.0.0.0`（`SUWAYOMI_IP` 默认值），只看试绑会把这种占用当成空闲。
+///
+/// 试绑探回环而非通配：通配监听会让防火墙为托盘 exe 弹一次放行询问。
+fn port_free(port: u16, listening: &HashSet<u16>) -> bool {
+    !listening.contains(&port)
+        && std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
 }
 
 /// 端口是否接受连接：server 生命周期的判据（无需扫进程表）。
@@ -520,10 +654,10 @@ fn ensure_data_dirs(data: &Path) -> Result<(), TrayError> {
     Ok(())
 }
 
-/// `inherit_stdio=true` 前台模式直接继承控制台；否则输出落 <appdata>/cache/logs/server.log
+/// `inherit_stdio=true` 前台模式直接继承控制台；否则输出落 <appdata>/logs/server.log
 fn spawn_server(
     data: &Path,
-    port: u16,
+    ports: Ports,
     inherit_stdio: bool,
     log: &Logger,
 ) -> Result<Child, TrayError> {
@@ -540,7 +674,7 @@ fn spawn_server(
 
     let mut command = Command::new(&bin);
     command.current_dir(data);
-    for (k, v) in server_env(data, port, &base, &appdata) {
+    for (k, v) in server_env(data, ports, &base, &appdata) {
         command.env(k, v);
     }
     if !inherit_stdio {
@@ -551,7 +685,10 @@ fn spawn_server(
 
     let child = command.spawn()?;
     if inherit_stdio {
-        eprintln!("[tray] spawned server {:?} on port {port}", bin);
+        eprintln!(
+            "[tray] spawned server {:?} on port {} (sandbox {})",
+            bin, ports.server, ports.sandbox
+        );
     }
     Ok(child)
 }
@@ -561,6 +698,8 @@ fn spawn_server(
 /// 监督者线程私有的状态：server 子进程的唯一所有者。
 struct ActorState {
     settings: Settings,
+    /// 本次运行实际使用的端口（`settings.server_port` 为 `None` 时是嗅探结果）
+    ports: Ports,
     data: PathBuf,
     child: Option<Child>,
     /// false = 托盘退出后不再关停 server（「隐藏托盘」，或已自行发起关闭）
@@ -574,12 +713,9 @@ struct ActorState {
 struct Runtime {
     settings: Settings,
     data: PathBuf,
-}
-
-impl Runtime {
-    fn port(&self) -> u16 {
-        self.settings.server_port
-    }
+    /// 实际监听中的端口。WebUI 窗口、关停请求、存活判定一律以它为准 ——
+    /// 用设置里的「请求值」在自动档下会指向一个没人监听的端口。
+    ports: Ports,
 }
 
 enum SupervisorMsg {
@@ -695,6 +831,7 @@ fn supervisor_loop(state: ActorState, rx: Receiver<SupervisorMsg>) {
                 let _ = reply.send(Runtime {
                     settings: state.settings.clone(),
                     data: state.data.clone(),
+                    ports: state.ports,
                 });
             }
             SupervisorMsg::Shutdown { reply } => {
@@ -706,29 +843,77 @@ fn supervisor_loop(state: ActorState, rx: Receiver<SupervisorMsg>) {
 
     // 线程退出（收到 Shutdown，或所有句柄被丢弃）：仍托管则发一次非阻塞的关闭请求
     if state.attached {
-        request_graceful_shutdown(state.settings.server_port, &state.log);
+        request_graceful_shutdown(state.ports.server, &state.log);
     }
     drop(state.child);
 }
 
+/// 选定本次运行的端口。自动档下端口可能被换掉，这是唯一会留下痕迹的地方。
+///
+/// `ours` 用来豁免「这个端口现在是**我们自己**的 server 在监听」—— 重启时它会先被
+/// 停掉，不豁免的话「重启服务端」在端口没改过时会被判成端口被占，永远重启不了。
+fn pick_ports(
+    settings: &Settings,
+    ours: impl Fn(u16) -> bool,
+    log: &Logger,
+) -> Result<Ports, TrayError> {
+    let listening = listening_ports();
+    pick_ports_with(settings, |p| port_free(p, &listening), ours, log)
+}
+
+/// 同 [`pick_ports`]，只是把「端口空闲」的判据也做成入参，测试可以塞假探针。
+fn pick_ports_with(
+    settings: &Settings,
+    is_free: impl Fn(u16) -> bool,
+    ours: impl Fn(u16) -> bool,
+    log: &Logger,
+) -> Result<Ports, TrayError> {
+    let free = |p: u16| is_free(p) || ours(p);
+    let Some(ports) = resolve_ports(settings.server_port, free) else {
+        let p = settings.server_port.unwrap_or(DEFAULT_PORT);
+        log.record(&format!(
+            "[tray] WARN: port {p} unavailable (occupied or reserved by the OS); \
+             change it in settings, or leave it empty to let the tray pick one"
+        ));
+        return Err(TrayError::PortUnavailable(p));
+    };
+    // 端口被换掉时记一笔。写死档下换端口不会发生（`resolve_ports` 直接报错），所以
+    // 这里描述的永远是自动档：起点默认端口用不了，向上顺延。
+    let start = settings.server_port.unwrap_or(DEFAULT_PORT);
+    if start != ports.server {
+        log.record(&format!(
+            "[tray] port {start} unavailable; using {} instead",
+            ports.server
+        ));
+    }
+    Ok(ports)
+}
+
 /// 落盘 → 建目录 → 停旧的 → 起新的。内存状态紧跟着磁盘提交，中途失败也不分叉。
 fn apply_settings(state: &mut ActorState, next: Settings) -> Result<(), TrayError> {
+    // 端口先定下来：定不下来就整个不动（旧 server 照常跑），设置窗口能原样报错
+    let ports = pick_ports(
+        &next,
+        |p| p == state.ports.server && server_running(p),
+        &state.log,
+    )?;
     save_settings_file(&next)?;
     let next_data = data_dir_of(&next);
     ensure_data_dirs(&next_data)?;
     std::fs::create_dir_all(&next_data)?;
 
-    stop_server(state.settings.server_port, &mut state.child, &state.log);
+    stop_server(state.ports.server, &mut state.child, &state.log);
 
-    let child = spawn_server(&next_data, next.server_port, false, &state.log);
+    let child = spawn_server(&next_data, ports, false, &state.log);
     // 配置已落盘，内存立即跟进 —— 状态与磁盘保持一致，即便启动失败
     state.settings = next;
+    state.ports = ports;
     state.data = next_data;
 
     match child {
         Ok(c) => {
             state.child = Some(c);
-            await_ready(state.settings.server_port, READY_TIMEOUT, &state.log);
+            await_ready(ports.server, READY_TIMEOUT, &state.log);
             Ok(())
         }
         Err(e) => {
@@ -747,18 +932,24 @@ fn save_only(_state: &mut ActorState, next: Settings) -> Result<(), TrayError> {
 
 /// 按当前配置重启：先优雅停（内部已等进程退出），再重新拉起。
 fn restart_server(state: &mut ActorState) -> Result<(), TrayError> {
-    let port = state.settings.server_port;
+    // 端口先定下来：定不下来就不停旧 server，避免「重启失败 = 服务直接没了」
+    let ports = pick_ports(
+        &state.settings,
+        |p| p == state.ports.server && server_running(p),
+        &state.log,
+    )?;
     let data = state.data.clone();
 
     state.log.record("[tray] restart: stopping running server");
-    stop_server(port, &mut state.child, &state.log);
+    stop_server(state.ports.server, &mut state.child, &state.log);
     // 进程已退出，但端口释放可能还有延迟
     std::thread::sleep(Duration::from_secs(2));
 
-    match spawn_server(&data, port, false, &state.log) {
+    match spawn_server(&data, ports, false, &state.log) {
         Ok(c) => {
             state.child = Some(c);
-            await_ready(port, RESTART_READY_TIMEOUT, &state.log);
+            state.ports = ports;
+            await_ready(ports.server, RESTART_READY_TIMEOUT, &state.log);
             Ok(())
         }
         Err(e) => {
@@ -801,7 +992,7 @@ fn show_settings_window(app: &tauri::AppHandle) {
 
 /// 打开/聚焦 WebUI 窗口（label "webui"，已存在→show+focus，销毁后重建）。
 /// 返回 false = 系统 WebView 不可用，调用方应回退系统浏览器。
-fn open_webui_window(app: &tauri::AppHandle, port: u16) -> bool {
+fn open_webui_window(app: &tauri::AppHandle, rt: &Runtime) -> bool {
     let log = app.state::<Logger>().inner().clone();
     if let Some(w) = app.get_webview_window(WEBUI_WINDOW_LABEL) {
         log.best_effort("show window", w.show());
@@ -811,8 +1002,9 @@ fn open_webui_window(app: &tauri::AppHandle, port: u16) -> bool {
         return true;
     }
 
-    let Ok(url) = tauri::Url::parse(&webui_url(port)) else {
-        log.record(&format!("[tray] invalid webui url for port {port}"));
+    let target = webui_url(rt.settings.server_address.as_deref(), rt.ports.server);
+    let Ok(url) = tauri::Url::parse(&target) else {
+        log.record(&format!("[tray] invalid webui url: {target}"));
         return false;
     };
 
@@ -823,8 +1015,9 @@ fn open_webui_window(app: &tauri::AppHandle, port: u16) -> bool {
         // 与 target=_blank/window.open 新窗请求，不在 WebView 里打开
         .on_navigation({
             let log = log.clone();
+            let address = rt.settings.server_address.clone();
             move |url| {
-                if is_webui_origin(url) {
+                if is_webui_origin(url, address.as_deref()) {
                     return true;
                 }
                 log.record(&format!("[tray] external link -> browser: {url}"));
@@ -848,7 +1041,7 @@ fn open_webui_window(app: &tauri::AppHandle, port: u16) -> bool {
             // 不 set_icon：标题栏与任务栏共用 WM_SETICON，set 后任务栏也会变
             log.best_effort("show window", w.show());
             log.best_effort("focus window", w.set_focus());
-            log.record(&format!("[tray] opened webui window: {}", webui_url(port)));
+            log.record(&format!("[tray] opened webui window: {target}"));
             true
         }
         Err(e) => {
@@ -863,10 +1056,10 @@ fn open_webui_window(app: &tauri::AppHandle, port: u16) -> bool {
 /// 打开 WebUI：设置开启且 WebView 窗口可用 → 窗口，否则系统浏览器
 fn launch_webui(app: &tauri::AppHandle, rt: &Runtime) {
     let log = app.state::<Logger>().inner().clone();
-    if rt.settings.prefer_web_view && open_webui_window(app, rt.port()) {
+    if rt.settings.prefer_web_view && open_webui_window(app, rt) {
         return;
     }
-    let url = webui_url(rt.port());
+    let url = webui_url(rt.settings.server_address.as_deref(), rt.ports.server);
     log.record(&format!("[tray] opening webui in system browser: {url}"));
     log.best_effort("open in browser", open::that(url));
 }
@@ -984,7 +1177,7 @@ fn run_action(action: TrayAction, app: &tauri::AppHandle, supervisor: &Superviso
             // 托盘立即退出：只发优雅关闭请求，server 后台自行收尾。
             // 已自行发起，标记 detach 以免退出收尾时重复请求。
             if let Some(rt) = supervisor.runtime() {
-                request_graceful_shutdown(rt.port(), &log);
+                request_graceful_shutdown(rt.ports.server, &log);
             }
             log.best_effort("detach supervisor", supervisor.detach());
             app.exit(0);
@@ -997,7 +1190,12 @@ fn run_action(action: TrayAction, app: &tauri::AppHandle, supervisor: &Superviso
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SettingsView {
-    server_port: u16,
+    /// 设置里写的端口；`null` = 自动（启动前嗅探一个能绑的）
+    server_port: Option<u16>,
+    /// 设置里写的服务器地址；空串 = 本机（此时 `web_ui_url` 由端口推出）
+    server_address: String,
+    /// 当前实际监听的端口。自动档下它由嗅探决定，与 `server_port` 无关
+    effective_port: u16,
     /// 当前实际生效的工作目录路径
     data_dir: String,
     /// 设置里的自定义目录（空 = 默认 base/data）
@@ -1012,11 +1210,13 @@ impl SettingsView {
     fn of(rt: &Runtime) -> SettingsView {
         SettingsView {
             server_port: rt.settings.server_port,
+            server_address: rt.settings.server_address.clone().unwrap_or_default(),
+            effective_port: rt.ports.server,
             data_dir: rt.data.display().to_string(),
             data_dir_override: rt.settings.data_dir.clone().unwrap_or_default(),
             open_web_ui_on_startup: rt.settings.open_web_ui_on_startup,
             prefer_web_view: rt.settings.prefer_web_view,
-            web_ui_url: webui_url(rt.settings.server_port),
+            web_ui_url: webui_url(rt.settings.server_address.as_deref(), rt.ports.server),
         }
     }
 }
@@ -1030,17 +1230,20 @@ fn get_settings(supervisor: State<Supervisor>) -> Result<SettingsView, TrayError
 #[tauri::command]
 fn save_settings(
     supervisor: State<Supervisor>,
-    server_port: u16,
+    server_port: Option<u16>,
+    server_address: Option<String>,
     data_dir: Option<String>,
     open_web_ui_on_startup: bool,
     prefer_web_view: bool,
 ) -> Result<(), TrayError> {
-    // 校验：非法端口直接拒绝，而不是悄悄 clamp 出一个用户没填过的数字
-    if !(1..=65535).contains(&server_port) {
-        return Err(TrayError::InvalidPort(server_port));
+    // 校验：写死的端口非法就拒绝，而不是悄悄 clamp 出一个用户没填过的数字。
+    // `None`（空 = 自动）合法，由托盘在启动前挑一个能绑的端口。
+    if let Some(p) = server_port.filter(|p| !(1..=65535).contains(p)) {
+        return Err(TrayError::InvalidPort(p));
     }
     let next: Settings = SettingsPatch {
-        server_port: Some(server_port),
+        server_port,
+        server_address,
         data_dir: Some(data_dir.unwrap_or_default()),
         open_web_ui_on_startup: Some(open_web_ui_on_startup),
         prefer_web_view: Some(prefer_web_view),
@@ -1063,8 +1266,13 @@ fn restart_server_cmd(
         log.best_effort("close webui window", w.close());
     }
     let settings = load_settings(&log);
-    supervisor.apply(settings.clone())?;
-    Ok(webui_url(settings.server_port))
+    supervisor.apply(settings)?;
+    // 端口可能被自动档换掉，回读运行态而不是照设置里的值拼 URL
+    let rt = supervisor.runtime().ok_or(TrayError::SupervisorDown)?;
+    Ok(webui_url(
+        rt.settings.server_address.as_deref(),
+        rt.ports.server,
+    ))
 }
 
 #[tauri::command]
@@ -1076,7 +1284,10 @@ fn open_data_dir(supervisor: State<Supervisor>) -> Result<(), TrayError> {
 #[tauri::command]
 fn webui_url_cmd(supervisor: State<Supervisor>) -> Result<String, TrayError> {
     let rt = supervisor.runtime().ok_or(TrayError::SupervisorDown)?;
-    Ok(webui_url(rt.port()))
+    Ok(webui_url(
+        rt.settings.server_address.as_deref(),
+        rt.ports.server,
+    ))
 }
 
 // ─────────────────────────── 9. 启动 ───────────────────────────
@@ -1097,19 +1308,25 @@ fn run_server_foreground() -> ! {
     // 无图形会话降级路径没有 AppHandle 可托管 Logger，直接用默认文件 sink 注入
     let log = Logger::file();
     let settings = load_settings(&log);
-    let port = settings.server_port;
+    let Ok(ports) = pick_ports(&settings, |_| false, &log) else {
+        eprintln!("configured port is unavailable; change it in tray settings");
+        std::process::exit(1);
+    };
     let data = data_dir_of(&settings);
     if let Err(e) = ensure_data_dirs(&data) {
         eprintln!("failed to prepare data dir: {e}");
         std::process::exit(1);
     }
 
-    if server_running(port) {
-        eprintln!("suwayomi-server already running on port {port}; nothing to do");
+    if server_running(ports.server) {
+        eprintln!(
+            "suwayomi-server already running on port {}; nothing to do",
+            ports.server
+        );
         std::process::exit(1);
     }
 
-    let mut child = match spawn_server(&data, port, true, &log) {
+    let mut child = match spawn_server(&data, ports, true, &log) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("{e}.\nPlace it in ./bin/ or set SUWAYOMI_BIN=/path/to/suwayomi-server");
@@ -1117,10 +1334,10 @@ fn run_server_foreground() -> ! {
         }
     };
 
-    await_ready(port, READY_TIMEOUT, &log);
+    await_ready(ports.server, READY_TIMEOUT, &log);
     eprintln!(
         "suwayomi-server ready on {} (Ctrl-C to stop)",
-        webui_url(port)
+        webui_url(settings.server_address.as_deref(), ports.server)
     );
 
     match child.wait() {
@@ -1156,22 +1373,30 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let log = app.state::<Logger>().inner().clone();
 
     let settings = load_settings(&log);
-    let port = settings.server_port;
     let data = data_dir_of(&settings);
     ensure_data_dirs(&data)?;
 
+    // 端口先定下来。挑不出来时不拦启动：托盘照常驻留，设置窗口是用户改端口的唯一入口。
+    let picked = pick_ports(&settings, |_| false, &log).ok();
+    let ports = picked.unwrap_or(Ports {
+        server: settings.server_port.unwrap_or(DEFAULT_PORT),
+        sandbox: SANDBOX_PORT_DEFAULT,
+    });
+
     // 探测只做一次：菜单文案与是否拉起 server 必须基于同一个答案
-    let already_running = server_running(port);
+    let already_running = picked.is_some() && server_running(ports.server);
     log.record(&format!("[tray] setup: server_running={already_running}"));
 
     let mut child = None;
-    if already_running {
+    if picked.is_none() {
+        log.record("[tray] server not started: configured port is unavailable");
+    } else if already_running {
         log.record("[tray] server already running; not starting another");
     } else {
-        match spawn_server(&data, port, false, &log) {
+        match spawn_server(&data, ports, false, &log) {
             Ok(c) => {
                 child = Some(c);
-                await_ready(port, READY_TIMEOUT, &log);
+                await_ready(ports.server, READY_TIMEOUT, &log);
             }
             Err(e) => log.record(&format!(
                 "[tray] WARN: server not started ({e}); set SUWAYOMI_BIN or place \
@@ -1190,6 +1415,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     let supervisor = Supervisor::spawn(ActorState {
         settings: settings.clone(),
+        ports,
         data: data.clone(),
         child,
         attached: true,
@@ -1245,7 +1471,14 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     // 启动即打开 WebUI（设置可关）：本托盘拉起或 server 已在运行都要开
     if settings.open_web_ui_on_startup && (started || already_running) {
-        launch_webui(app.handle(), &Runtime { settings, data });
+        launch_webui(
+            app.handle(),
+            &Runtime {
+                settings,
+                data,
+                ports,
+            },
+        );
     }
     Ok(())
 }
@@ -1335,7 +1568,9 @@ mod tests {
     #[test]
     fn missing_fields_fold_to_defaults() {
         let s = settings("{}");
-        assert_eq!(s.server_port, DEFAULT_PORT);
+        // 没写端口 = 自动档，由托盘启动前嗅探（不是把默认端口钉进设置里）
+        assert_eq!(s.server_port, None);
+        assert_eq!(s.server_address, None);
         assert_eq!(s.data_dir, None);
         assert!(s.open_web_ui_on_startup);
         assert!(s.prefer_web_view);
@@ -1344,9 +1579,27 @@ mod tests {
     #[test]
     fn partial_file_keeps_unspecified_defaults() {
         let s = settings(r#"{"serverPort": 9000}"#);
-        assert_eq!(s.server_port, 9000);
+        assert_eq!(s.server_port, Some(9000));
         assert_eq!(s.data_dir, None);
         assert!(s.prefer_web_view);
+    }
+
+    /// 自动档要能原样往返：写出去的形状读不回来，托盘下次启动就静默回到内置默认值，
+    /// 表现成「设置没生效」。
+    #[test]
+    fn auto_port_round_trips_through_the_settings_file() {
+        let s = Settings {
+            server_port: None,
+            server_address: None,
+            data_dir: None,
+            open_web_ui_on_startup: true,
+            prefer_web_view: false,
+        };
+        let json = serde_json::to_string(&s).expect("serialize settings");
+        assert!(json.contains(r#""serverPort":null"#), "{json}");
+        let back = settings(&json);
+        assert_eq!(back.server_port, None);
+        assert!(!back.prefer_web_view);
     }
 
     /// 「未设置工作目录」只有一种表示：空串与空白都折叠为 None
@@ -1362,19 +1615,121 @@ mod tests {
         );
     }
 
+    /// 服务器地址同理：「未设置」只有一种表示（留空 = 本机回环）
     #[test]
-    fn out_of_range_port_falls_back_to_default() {
-        // 0 是合法 u16 但不是合法端口 → 字段级回落到默认
-        assert_eq!(settings(r#"{"serverPort": 0}"#).server_port, DEFAULT_PORT);
-        assert_eq!(settings(r#"{"serverPort": 65535}"#).server_port, 65535);
+    fn blank_server_address_is_none() {
+        assert_eq!(settings(r#"{"serverAddress": ""}"#).server_address, None);
+        assert_eq!(settings(r#"{"serverAddress": "  "}"#).server_address, None);
+        assert_eq!(
+            settings(r#"{"serverAddress": " 192.168.1.10 "}"#)
+                .server_address
+                .as_deref(),
+            Some("192.168.1.10")
+        );
+    }
+
+    #[test]
+    fn out_of_range_port_falls_back_to_auto() {
+        // 0 是合法 u16 但不是合法端口 → 当作没写（自动档）
+        assert_eq!(settings(r#"{"serverPort": 0}"#).server_port, None);
+        assert_eq!(
+            settings(r#"{"serverPort": 65535}"#).server_port,
+            Some(65535)
+        );
         // 超出 u16 连反序列化都过不去 → 整个文件判为损坏，回落全套默认
         assert!(serde_json::from_str::<Settings>(r#"{"serverPort": 70000}"#).is_err());
     }
 
     #[test]
     fn default_settings_comes_from_the_empty_patch() {
-        assert_eq!(Settings::default().server_port, DEFAULT_PORT);
+        assert_eq!(Settings::default().server_port, None);
         assert_eq!(Settings::default().data_dir, None);
+    }
+
+    /// 自动档：从默认端口起向上取第一个能绑的
+    #[test]
+    fn auto_port_walks_up_from_the_default() {
+        assert_eq!(
+            resolve_ports(None, |_| true).map(|p| p.server),
+            Some(DEFAULT_PORT)
+        );
+        assert_eq!(
+            resolve_ports(None, |p| p != DEFAULT_PORT).map(|p| p.server),
+            Some(DEFAULT_PORT + 1)
+        );
+        // 全被占：不 panic、不返回半个状态
+        assert_eq!(resolve_ports(None, |_| false), None);
+    }
+
+    /// 写死的端口不可用时报错，不悄悄换一个 —— 换了以后用户按原端口配的
+    /// 防火墙/端口转发全部失效，界面上也看不出服务搬去了哪
+    #[test]
+    fn explicit_port_is_never_silently_replaced() {
+        assert_eq!(
+            resolve_ports(Some(9999), |_| true).map(|p| p.server),
+            Some(9999)
+        );
+        assert_eq!(resolve_ports(Some(9999), |p| p != 9999), None);
+    }
+
+    /// 沙盒端口必须避开 server 端口：撞上时沙盒启动会清掉占用者，也就是杀掉 server
+    #[test]
+    fn sandbox_port_never_collides_with_the_server_port() {
+        // 用户把 server 钉在沙盒的默认端口上 → 沙盒让位
+        let ports = resolve_ports(Some(SANDBOX_PORT_DEFAULT), |_| true).expect("ports");
+        assert_eq!(ports.server, SANDBOX_PORT_DEFAULT);
+        assert_eq!(ports.sandbox, SANDBOX_PORT_DEFAULT + 1);
+
+        // 自动档同样不撞
+        let auto = resolve_ports(None, |_| true).expect("ports");
+        assert_ne!(auto.sandbox, auto.server);
+
+        // 沙盒端口一个空位都没有：不拒绝启动（扩展不可用不该挡住书架/阅读），
+        // 退回默认值，由沙盒侧自己再顺延
+        let ports = resolve_ports(Some(1234), |p| p == 1234).expect("ports");
+        assert_eq!(ports.sandbox, SANDBOX_PORT_DEFAULT);
+    }
+
+    /// 试绑探测要真的能看出端口被占 —— 用临时端口，避免和别的测试抢固定端口
+    #[test]
+    fn port_free_sees_an_occupied_port() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("bind ephemeral");
+        let port = listener.local_addr().expect("local addr").port();
+        assert!(!port_free(port, &HashSet::new()));
+        drop(listener);
+        assert!(port_free(port, &HashSet::new()));
+    }
+
+    /// 只在通配地址上被占的端口也必须算「不可用」：Windows 上 `0.0.0.0:P` 被占时
+    /// 回环仍能绑上，而 server 绑的正是通配 —— 只试绑会把这种占用当成空闲，
+    /// 于是 server 自己顺延到别的端口，托盘拼出的 URL 指向没人监听的地址。
+    #[test]
+    fn port_free_sees_a_wildcard_listener() {
+        let listener = std::net::TcpListener::bind(("0.0.0.0", 0)).expect("bind wildcard");
+        let port = listener.local_addr().expect("local addr").port();
+        assert!(
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok(),
+            "前提：通配被占时回环仍可绑（否则这个测试证明不了 netstat 那一路有用）"
+        );
+        assert!(!port_free(port, &listening_ports()));
+    }
+
+    /// 「重启服务端」时端口上还坐着我们自己的 server：它不算被占。不豁免的话，
+    /// 端口没改过的重启会被永久拒绝，而重启正是让设置生效的唯一入口。
+    #[test]
+    fn own_server_holding_the_port_does_not_block_a_restart() {
+        let log = Logger {
+            sink: Arc::new(|_: &str| {}),
+        };
+        let settings = settings(r#"{"serverPort": 9000}"#);
+        // 探针说「9000 被占」，而占它的正是我们自己 → 放行
+        let ports = pick_ports_with(&settings, |_| false, |p| p == 9000, &log).expect("重启应放行");
+        assert_eq!(ports.server, 9000);
+
+        // 占着它的是别人：拒绝，且报错里带上端口号
+        let err = pick_ports_with(&settings, |_| false, |_| false, &log).expect_err("应拒绝");
+        assert!(matches!(err, TrayError::PortUnavailable(9000)), "{err}");
     }
 
     #[test]
@@ -1392,11 +1747,12 @@ mod tests {
     fn settings_and_logs_sit_under_the_appdata_root() {
         let root = appdata_dir();
         assert_eq!(settings_path(), root.join("settings").join("tray.json"));
-        assert_eq!(logs_dir(), root.join("cache").join("logs"));
+        assert_eq!(logs_dir(), root.join("logs"));
         assert_eq!(
             APPDATA_SUBDIRS,
             [
-                "cache/logs",
+                "cache",
+                "logs",
                 "db",
                 "settings",
                 "extensions/apk",
@@ -1406,31 +1762,66 @@ mod tests {
     }
 
     #[test]
-    fn webui_url_is_loopback() {
-        assert_eq!(webui_url(8090), "http://127.0.0.1:8090");
+    fn webui_url_defaults_to_loopback_and_honours_the_configured_address() {
+        // 留空 = 本机回环 + 实际端口，与没有这个设置时完全一样
+        assert_eq!(
+            webui_url(None, DEFAULT_PORT),
+            format!("http://127.0.0.1:{DEFAULT_PORT}")
+        );
+        assert_eq!(
+            webui_url(Some("  "), DEFAULT_PORT),
+            format!("http://127.0.0.1:{DEFAULT_PORT}")
+        );
+        // 只给 host 就补上实际端口；自带端口或协议的原样用
+        assert_eq!(
+            webui_url(Some("192.168.1.10"), 4569),
+            "http://192.168.1.10:4569"
+        );
+        assert_eq!(
+            webui_url(Some("192.168.1.10:80"), 4569),
+            "http://192.168.1.10:80"
+        );
+        assert_eq!(
+            webui_url(Some("https://nas.local"), 4569),
+            "https://nas.local:4569"
+        );
+        assert_eq!(
+            webui_url(Some("http://[::1]:4569/"), 4569),
+            "http://[::1]:4569"
+        );
     }
 
     #[test]
-    fn only_local_origins_are_allowed_in_the_webview() {
-        let localhost = tauri::Url::parse("http://127.0.0.1:8090/x").unwrap();
-        let named = tauri::Url::parse("http://localhost:8090").unwrap();
+    fn only_webui_origins_are_allowed_in_the_webview() {
+        let localhost = tauri::Url::parse("http://127.0.0.1:4567/x").unwrap();
+        let named = tauri::Url::parse("http://localhost:4567").unwrap();
         let external = tauri::Url::parse("https://example.com").unwrap();
-        assert!(is_webui_origin(&localhost));
-        assert!(is_webui_origin(&named));
-        assert!(!is_webui_origin(&external));
+        let remote = tauri::Url::parse("http://192.168.1.10:4569/x").unwrap();
+        assert!(is_webui_origin(&localhost, None));
+        assert!(is_webui_origin(&named, None));
+        assert!(!is_webui_origin(&external, None));
+        // 指定了服务器地址后，那个源自己的跳转不能再被当成外部链接
+        assert!(is_webui_origin(&remote, Some("192.168.1.10")));
+        assert!(is_webui_origin(&remote, Some("http://192.168.1.10:4569")));
+        assert!(!is_webui_origin(&remote, Some("nas.local")));
+        assert!(!is_webui_origin(&external, Some("192.168.1.10")));
     }
 
     #[test]
     fn server_env_covers_every_dir_the_server_needs() {
         let env = server_env(
             Path::new("/data"),
-            1234,
+            Ports {
+                server: 1234,
+                sandbox: 5678,
+            },
             Path::new("/base"),
             Path::new("/appdata"),
         );
         let keys = env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>();
         for k in [
             "SUWAYOMI_PORT",
+            "SUWAYOMI_SANDBOX_PORT",
             "SUWAYOMI_APPDATA_DIR",
             "SUWAYOMI_DATA_DIR",
             "SUWAYOMI_WEBUI_DIR",
@@ -1450,18 +1841,17 @@ mod tests {
         ] {
             assert!(!keys.contains(&k), "不应再传 {k}");
         }
-        let port = env
-            .iter()
-            .find(|(k, _)| k == "SUWAYOMI_PORT")
-            .map(|(_, v)| v.clone())
-            .unwrap();
-        assert_eq!(port, "1234");
-        let appdata = env
-            .iter()
-            .find(|(k, _)| k == "SUWAYOMI_APPDATA_DIR")
-            .map(|(_, v)| v.clone())
-            .unwrap();
-        assert_eq!(appdata, "/appdata");
+        let value = |k: &str| {
+            env.iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        assert_eq!(value("SUWAYOMI_PORT"), "1234");
+        // 沙盒端口必须一并传给 server：不传它就用内置的 4568，撞上 server 的端口时
+        // 沙盒启动会先把占用者清掉
+        assert_eq!(value("SUWAYOMI_SANDBOX_PORT"), "5678");
+        assert_eq!(value("SUWAYOMI_APPDATA_DIR"), "/appdata");
     }
 
     /// 候选表里绝不能出现托盘自己：server 缺失时会变成 fork 炸弹
@@ -1521,11 +1911,34 @@ mod tests {
         let rt = Runtime {
             settings: settings(r#"{"dataDir":"/srv","preferWebView":false}"#),
             data: PathBuf::from("/srv"),
+            ports: Ports {
+                server: 4569,
+                sandbox: SANDBOX_PORT_DEFAULT,
+            },
         };
         let view = SettingsView::of(&rt);
         assert_eq!(view.data_dir, "/srv");
         assert_eq!(view.data_dir_override, "/srv");
         assert!(!view.prefer_web_view);
-        assert_eq!(view.web_ui_url, webui_url(DEFAULT_PORT));
+        // 自动档（settings 里没写端口）下 URL 跟的是**实际监听**的那个，不是默认值
+        assert_eq!(view.server_port, None);
+        assert_eq!(view.effective_port, 4569);
+        assert_eq!(view.web_ui_url, webui_url(None, 4569));
+    }
+
+    /// 设置里指定了服务器地址，读模型与打开的地址都得跟着走
+    #[test]
+    fn settings_view_exposes_the_configured_server_address() {
+        let rt = Runtime {
+            settings: settings(r#"{"serverAddress":"192.168.1.10"}"#),
+            data: PathBuf::from("/srv"),
+            ports: Ports {
+                server: 4569,
+                sandbox: SANDBOX_PORT_DEFAULT,
+            },
+        };
+        let view = SettingsView::of(&rt);
+        assert_eq!(view.server_address, "192.168.1.10");
+        assert_eq!(view.web_ui_url, "http://192.168.1.10:4569");
     }
 }
