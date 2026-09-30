@@ -10,6 +10,7 @@
 # .github/workflows/release.yml.
 #
 # Usage: bash build-tray.sh  (from anywhere; runs cargo build --release)
+#        SUWAYOMI_TRAY_TARGET=x86_64-pc-windows-gnullvm bash build-tray.sh   # 指定 cross target
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -50,8 +51,17 @@ print(f"[build-tray] version injected: {ver}")
 PYEOF
 
 # --- build ---
-cargo build --release
+# SUWAYOMI_TRAY_TARGET 指定 rust target（CI 传 matrix.rust_target）；不传就编宿主 —— 本地
+# 改一行试一下不必多出一份 target/<triple>/。
+TGT="${SUWAYOMI_TRAY_TARGET:-}"
+if [ -n "$TGT" ]; then
+  echo "[build-tray] target=${TGT}"
+  cargo build --release --target "$TGT"
+  OUT="target/${TGT}/release/suwayomi"
+else
+  cargo build --release
+  OUT="target/release/suwayomi"
+fi
 # 产物名：Windows 带 .exe，Linux/macOS 无后缀
-OUT="target/release/suwayomi"
 [ -f "${OUT}.exe" ] && OUT="${OUT}.exe"
 echo "[build-tray] done: ${OUT}"

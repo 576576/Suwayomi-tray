@@ -40,6 +40,10 @@ SUWAYOMI_TRAY_VERSION=1.0.23 bash build-tray.sh
 
 版本号必须是三段 semver（会注入 `tauri.conf.json`，Windows 上还进 PE 版本资源）。不传时按本仓库的提交数推算，规则同 CI。
 
+脚本默认编宿主 target；`SUWAYOMI_TRAY_TARGET=<rust target>` 可指定目标（CI 传矩阵里的那个），产物落在 `target/<target>/release/`。
+
+编译 Windows 的 `*-pc-windows-gnullvm` 目标要先让 PATH 里有 llvm-mingw —— 它的 linker（`<triple>-clang`）与 PE 资源编译（`windres`）都由那套工具链提供，rustup 给的 `lib/self-contained/` 只有 `crt2.o` / `dllcrt2.o`，缺 `libmingw32` / `libmingwex`；MSVC 工具链在这个 target 下不参与。该目标的 exe 动态链 `WebView2Loader.dll`（与 msvc 那份的静态链不同），所以发布时两个文件要一起。
+
 注入是**临时**的：脚本编译前改写 `tauri.conf.json`、编译后还原。仓库里这个字段应保持与 `Cargo.toml` 的 `package.version` 一致，`.githooks/pre-commit` 会拦住注入残留（见「提交前钩子」）。
 
 ## 提交前钩子
@@ -66,10 +70,12 @@ git config core.hooksPath .githooks
 
 ## 发布
 
-CI 与 Suwayomi-next 同款结构：`.github/workflows/build.yml`（可复用构建）+ `.github/workflows/release.yml`（触发器、版本号、发布）。产物是六个桌面 target 的资产：
+CI 与 Suwayomi-next 同款结构：`.github/workflows/build.yml`（可复用构建）+ `.github/workflows/release.yml`（触发器、版本号、发布）。产物是桌面 target 的资产：
 
 ```
 suwayomi-tray-<version>-<target>[.exe]
 ```
 
-Suwayomi-next 的打包流程按 target 从 Release 取用：正式通道只认非预发布版本，alpha/beta 跟最新构建。
+手动 dispatch 有 `windows_toolchain` 三选（`msvc` / `gnullvm` / `all`），口径与主仓 Suwayomi-next 一致：`gnullvm` 那份的资产名在 target 后多一段 `-gnullvm`（`suwayomi-tray-<version>-windows-x64-gnullvm.exe`），并**另发一份同名换扩展名的 `WebView2Loader.dll`**（gnullvm 的托盘动态链它，两个文件必须放在一起）；推送 main 的自动 alpha 恒用 `msvc`。`all` 是两套都出。
+
+Suwayomi-next 的打包流程按 target 从 Release 取用（target 名里带工具链段，所以取到的桌面壳与它自己那份 server 同工具链）：正式通道只认非预发布版本，alpha/beta 跟最新构建。
