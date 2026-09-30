@@ -1554,10 +1554,10 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             } = event
             {
                 let app = tray.app_handle();
-                if let Some(supervisor) = app.try_state::<Supervisor>() {
-                    if let Some(rt) = supervisor.runtime() {
-                        launch_webui(app, &rt);
-                    }
+                if let Some(supervisor) = app.try_state::<Supervisor>()
+                    && let Some(rt) = supervisor.runtime()
+                {
+                    launch_webui(app, &rt);
                 }
             }
         })
@@ -2015,9 +2015,10 @@ mod tests {
         }
         // server 自己按发布布局找得到的东西都不传：webui 在 exe 同级 `bin/` 的上一级。
         // 传了反而多一条「托盘说的位置」与「server 实际用的位置」分叉的路。
-        for k in ["SUWAYOMI_WEBUI_DIR"] {
-            assert!(!keys.contains(&k), "不应再传 {k}");
-        }
+        assert!(
+            !keys.contains(&"SUWAYOMI_WEBUI_DIR"),
+            "不应再传 SUWAYOMI_WEBUI_DIR"
+        );
         // 目录级旋钮只剩 appdata / data 两个根：按子目录拆分的、以及按用户数据项
         // （下载 / 本地图源）拆分的变量都不应再传。
         for k in [

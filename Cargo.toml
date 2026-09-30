@@ -2,7 +2,7 @@
 name = "suwayomi-tray"
 version = "0.1.0"
 description = "Suwayomi 桌面壳：无头 server + 系统托盘 + WebUI 窗口（Tauri 2）"
-edition = "2021"
+edition = "2024"
 
 # 产物名：suwayomi.exe（桌面壳；无头服务器为 suwayomi-server.exe）
 [[bin]]

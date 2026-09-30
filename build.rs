@@ -45,16 +45,15 @@ fn embed_tray_icon(rel: &str) {
     };
 
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR 未设置（cargo 一定会提供）");
-    fs::write(format!("{out_dir}/tray_icon.rgba"), &rgba)
-        .expect("写入解码后的托盘图标字节失败");
+    fs::write(format!("{out_dir}/tray_icon.rgba"), &rgba).expect("写入解码后的托盘图标字节失败");
 
-    let gen = format!(
+    let generated = format!(
         "pub const TRAY_ICON_RGBA: &[u8] = \
          include_bytes!(concat!(env!(\"OUT_DIR\"), \"/tray_icon.rgba\"));\n\
          pub const TRAY_ICON_W: u32 = {w};\n\
          pub const TRAY_ICON_H: u32 = {h};\n"
     );
-    fs::write(format!("{out_dir}/tray_icon.rs"), gen).expect("写入托盘图标常量失败");
+    fs::write(format!("{out_dir}/tray_icon.rs"), generated).expect("写入托盘图标常量失败");
 
     // 图标变化时需要重新生成
     println!("cargo:rerun-if-changed={rel}");
