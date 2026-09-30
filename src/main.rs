@@ -387,7 +387,10 @@ fn server_bin_candidates() -> impl Iterator<Item = PathBuf> {
 ///
 /// 可写根必须显式传：server 自己的兜底是「exe 同级的 `appdata/`」，而安装目录只读时
 /// 那个位置不可写，托盘才知道该指到哪。
-fn server_env(data: &Path, ports: Ports, base: &Path, appdata: &Path) -> Vec<(String, OsString)> {
+///
+/// `webui/` 不传：它恒在包内（只读资源，不参与外指），server 按发布布局在 exe 同级
+/// 的 `bin/` 与它的上一级找得到。
+fn server_env(data: &Path, ports: Ports, appdata: &Path) -> Vec<(String, OsString)> {
     vec![
         ("SUWAYOMI_PORT".into(), ports.server.to_string().into()),
         // 沙盒端口由托盘指定：两者默认值相邻，server 的监听端口自顺延时可能正好落到
@@ -404,10 +407,6 @@ fn server_env(data: &Path, ports: Ports, base: &Path, appdata: &Path) -> Vec<(St
         // `cwd/data`，而 cwd 已经设成 data，最后那档会推成 `<data>/data`。
         // 下载 / 本地图源 / 自动备份都在这个根之下，没有各自的变量。
         ("SUWAYOMI_DATA_DIR".into(), data.as_os_str().to_os_string()),
-        (
-            "SUWAYOMI_WEBUI_DIR".into(),
-            base.join("webui").into_os_string(),
-        ),
     ]
 }
 
@@ -767,7 +766,6 @@ fn spawn_server(
     log: &Logger,
 ) -> Result<Child, TrayError> {
     let bin = find_server_bin(log).ok_or(TrayError::ServerNotFound)?;
-    let base = base_dir();
     let appdata = appdata_dir();
     ensure_appdata_dirs(&appdata)?;
     let logs = logs_dir();
@@ -779,7 +777,7 @@ fn spawn_server(
 
     let mut command = Command::new(&bin);
     command.current_dir(data);
-    for (k, v) in server_env(data, ports, &base, &appdata) {
+    for (k, v) in server_env(data, ports, &appdata) {
         command.env(k, v);
     }
     if !inherit_stdio {
@@ -2004,7 +2002,6 @@ mod tests {
                 server: 1234,
                 sandbox: 5678,
             },
-            Path::new("/base"),
             Path::new("/appdata"),
         );
         let keys = env.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>();
@@ -2013,9 +2010,13 @@ mod tests {
             "SUWAYOMI_SANDBOX_PORT",
             "SUWAYOMI_APPDATA_DIR",
             "SUWAYOMI_DATA_DIR",
-            "SUWAYOMI_WEBUI_DIR",
         ] {
             assert!(keys.contains(&k), "missing {k}");
+        }
+        // server 自己按发布布局找得到的东西都不传：webui 在 exe 同级 `bin/` 的上一级。
+        // 传了反而多一条「托盘说的位置」与「server 实际用的位置」分叉的路。
+        for k in ["SUWAYOMI_WEBUI_DIR"] {
+            assert!(!keys.contains(&k), "不应再传 {k}");
         }
         // 目录级旋钮只剩 appdata / data 两个根：按子目录拆分的、以及按用户数据项
         // （下载 / 本地图源）拆分的变量都不应再传。
