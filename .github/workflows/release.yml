@@ -78,6 +78,13 @@ on:
         type: string
         default: ''
 
+concurrency:
+  # 同一 ref 上的发布排队而不是并行：主仓的 refresh_companions 会派发这里，两次派发撞上时
+  # 并行跑同一批 target 会白烧 runner 分钟（macOS 还是 10x 计费），并让"哪条 run 对应哪个
+  # release"变得难认。ext-runtime 的 release.yml 是同一条规则。
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
