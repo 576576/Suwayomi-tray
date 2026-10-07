@@ -1814,9 +1814,13 @@ mod tests {
     fn port_free_sees_a_wildcard_listener() {
         let listener = std::net::TcpListener::bind(("0.0.0.0", 0)).expect("bind wildcard");
         let port = listener.local_addr().expect("local addr").port();
+        let loopback_free =
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok();
+        // 非 Windows 上没有这个前提：通配被占时回环也绑不上（bind 报 EADDRINUSE），
+        // 那种平台靠试绑就能判出占用。
         assert!(
-            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok(),
-            "前提：通配被占时回环仍可绑（否则这个测试证明不了 netstat 那一路有用）"
+            loopback_free || !cfg!(windows),
+            "前提：Windows 上通配被占时回环仍可绑（否则这个测试证明不了 netstat 那一路有用）"
         );
         assert!(!port_free(port, &listening_ports()));
     }
