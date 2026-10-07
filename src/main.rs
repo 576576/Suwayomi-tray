@@ -1796,9 +1796,17 @@ mod tests {
         assert_eq!(ports.sandbox, SANDBOX_PORT_DEFAULT);
     }
 
+    /// 端口命名空间是进程外共享的，而下面两条测试都要从临时端口池取号：一条「取号 →
+    /// 释放 → 立刻取回」与另一条取号重叠时，另一条可能刚好拿到刚释放的那个号，后置断言
+    /// 随之翻转（Linux CI 上实测到过）。本仓库只有这两条测试碰 socket，串起来即可。
+    static PORT_TESTS: Mutex<()> = Mutex::new(());
+
     /// 试绑探测要真的能看出端口被占 —— 用临时端口，避免和别的测试抢固定端口
     #[test]
     fn port_free_sees_an_occupied_port() {
+        // 绑住命名空间，别让另一条端口测试在下面那几微秒里取号；名字不能省成 `_`
+        // （`let _ =` 会立刻把 guard 丢掉）
+        let _serial = PORT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .expect("bind ephemeral");
         let port = listener.local_addr().expect("local addr").port();
@@ -1812,6 +1820,7 @@ mod tests {
     /// 于是 server 自己顺延到别的端口，托盘拼出的 URL 指向没人监听的地址。
     #[test]
     fn port_free_sees_a_wildcard_listener() {
+        let _serial = PORT_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let listener = std::net::TcpListener::bind(("0.0.0.0", 0)).expect("bind wildcard");
         let port = listener.local_addr().expect("local addr").port();
         let loopback_free =
