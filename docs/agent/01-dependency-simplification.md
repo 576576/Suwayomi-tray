@@ -3,7 +3,7 @@
 - 项目：`suwayomi-tray` v0.1.0（Tauri 2 桌面壳）
 - 工具链：cargo 1.98.1 / tauri 2.11.5 / tauri-build 2.6.3
 - 评估日期：2026-09-26
-- 复核脚本：`docs/migration/dep-cost.py`（重跑可复现本文的"独占包"数字）
+- 复核脚本：`docs/agent/dep-cost.py`（重跑可复现本文的"独占包"数字）
 
 ---
 
@@ -252,7 +252,7 @@ cargo tree --prefix none --target x86_64-unknown-linux-gnu | sort -u | wc -l
 cargo tree --prefix none --target x86_64-apple-darwin      | sort -u | wc -l
 
 # lock 里哪些包只为某个直接依赖而存在
-python docs/migration/dep-cost.py
+python docs/agent/dep-cost.py
 
 # 是否有版本重复
 cargo tree --duplicates

@@ -79,3 +79,7 @@ suwayomi-tray-<version>-<target>[.exe]
 手动 dispatch 有 `windows_toolchain` 三选（`msvc` / `gnullvm` / `all`），口径与主仓 Suwayomi-next 一致：`gnullvm` 那份的资产名在 target 后多一段 `-gnullvm`（`suwayomi-tray-<version>-windows-x64-gnullvm.exe`），并**另发一份同名换扩展名的 `WebView2Loader.dll`**（gnullvm 的托盘动态链它，两个文件必须放在一起）；推送 main 的自动 alpha 恒用 `msvc`。`all` 是两套都出。
 
 Suwayomi-next 的打包流程按 target 从 Release 取用（target 名里带工具链段，所以取到的桌面壳与它自己那份 server 同工具链）：正式通道只认非预发布版本，alpha/beta 跟最新构建。
+
+## 文档
+
+面向维护者的文档在 [`docs/agent/`](docs/agent/README.md)：依赖与代码风格两份评估报告（含复核脚本）。
