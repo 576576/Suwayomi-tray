@@ -70,7 +70,7 @@ git config core.hooksPath .githooks
 
 ## 发布
 
-CI 与 Suwayomi-next 同款结构：`.github/workflows/build.yml`（可复用构建）+ `.github/workflows/release.yml`（触发器、版本号、发布）。产物是桌面 target 的资产：
+CI 与 Suwayomi-next 同款结构：`.github/workflows/build.yml`（可复用构建）+ `.github/workflows/release.yml`（触发器、版本号、发布）+ `.github/workflows/lint.yml`（质量门禁，由发布链与 PR 两处调起）+ `.github/workflows/pr.yml`（PR 把关，只调门禁）。产物是桌面 target 的资产：
 
 ```
 suwayomi-tray-<version>-<target>[.exe]
