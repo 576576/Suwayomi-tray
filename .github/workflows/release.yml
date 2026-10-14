@@ -206,14 +206,14 @@ jobs:
           echo "   targets=[$SEL] win_tc=$WIN_TC"
 
   lint:
-    name: 质量门禁（复用 lint.yml）
+    name: 质量门禁
     # 与 prep 并行，不占发布链路的时间；门禁不过时由 build 的 needs 拦住编译。
     permissions:
       contents: read
     uses: ./.github/workflows/lint.yml
 
   build:
-    name: 构建（复用 build.yml）
+    name: 构建
     needs: [prep, lint]
     permissions:
       contents: read
